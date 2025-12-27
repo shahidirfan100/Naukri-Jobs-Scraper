@@ -1,0 +1,93 @@
+{
+    "title": "Naukri Jobs Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchUrl": {
+            "title": "Search URL (Optional)",
+            "type": "string",
+            "description": "Direct Naukri.com search URL to scrape from. If provided, other search parameters will be ignored. Example: https://www.naukri.com/sales-jobs-in-mumbai",
+            "editor": "textfield",
+            "prefill": "https://www.naukri.com/sales-jobs-in-mumbai"
+        },
+        "searchQuery": {
+            "title": "Search Query",
+            "type": "string",
+            "description": "Job title or keywords to search for (e.g., 'sales', 'software engineer', 'data analyst', 'marketing manager'). Required if searchUrl is not provided.",
+            "editor": "textfield",
+            "default": "sales",
+            "prefill": "sales"
+        },
+        "location": {
+            "title": "Location",
+            "type": "string",
+            "description": "Location to search for jobs in India (e.g., 'Mumbai', 'Delhi', 'Bangalore', 'Hyderabad', 'Chennai', 'Pune'). Required if searchUrl is not provided.",
+            "editor": "textfield",
+            "default": "Mumbai",
+            "prefill": "Mumbai"
+        },
+        "maxJobs": {
+            "title": "Maximum Jobs",
+            "type": "integer",
+            "description": "Maximum number of job listings to scrape (0 = unlimited). Default is 20 for optimal performance.",
+            "default": 20,
+            "minimum": 0,
+            "maximum": 10000
+        },
+        "experience": {
+            "title": "Experience Level",
+            "type": "string",
+            "description": "Filter by required years of experience",
+            "default": "all",
+            "enum": [
+                "all",
+                "0-1",
+                "1-3",
+                "3-5",
+                "5-10",
+                "10+"
+            ],
+            "enumTitles": [
+                "All Experience Levels",
+                "0-1 Years (Fresher)",
+                "1-3 Years",
+                "3-5 Years",
+                "5-10 Years",
+                "10+ Years"
+            ]
+        },
+        "jobType": {
+            "title": "Job Type",
+            "type": "string",
+            "description": "Filter by employment type",
+            "default": "all",
+            "enum": [
+                "all",
+                "full-time",
+                "part-time",
+                "contract",
+                "internship"
+            ],
+            "enumTitles": [
+                "All Types",
+                "Full Time",
+                "Part Time",
+                "Contract",
+                "Internship"
+            ]
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Proxy settings for bypassing anti-bot protection. Recommended for reliable scraping.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true
+            }
+        }
+    },
+    "required": [
+        "searchQuery",
+        "location"
+    ]
+}

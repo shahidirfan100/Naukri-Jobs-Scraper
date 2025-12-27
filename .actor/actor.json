@@ -1,0 +1,21 @@
+{
+    "actorSpecification": 1,
+    "name": "naukri-jobs-scraper",
+    "title": "Naukri Jobs Scraper",
+    "description": "Extract job listings from Naukri.com with advanced search filters. Get comprehensive job data including titles, companies, locations, salaries, descriptions, and direct application links from India's #1 job portal. Perfect for job market analysis, recruitment automation, and employment research.",
+    "version": "1.0",
+    "categories": [
+        "BUSINESS",
+        "JOBS"
+    ],
+    "meta": {
+        "templateId": "naukri-jobs-scraper",
+        "generatedBy": "GPT-4.1"
+    },
+    "input": "./input_schema.json",
+    "output": "./output_schema.json",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    },
+    "dockerfile": "../Dockerfile"
+}

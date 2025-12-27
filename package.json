@@ -1,0 +1,46 @@
+{
+    "name": "naukri-jobs-scraper",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "Extract job listings from Naukri.com with advanced filtering options including location, keywords, salary, job type, and experience level. Get structured job data including titles, companies, locations, salaries, and descriptions from India's leading job portal.",
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "dependencies": {
+        "apify": "^3.5.2",
+        "camoufox-js": "^0.7.0",
+        "crawlee": "^3.15.3",
+        "cheerio": "^1.0.0-rc.12",
+        "got-scraping": "^4.1.2",
+        "playwright": "1.56.1"
+    },
+    "devDependencies": {
+        "@apify/eslint-config": "^1.0.0",
+        "eslint": "^9.29.0",
+        "eslint-config-prettier": "^10.1.5",
+        "prettier": "^3.5.3"
+    },
+    "scripts": {
+        "start": "node src/main.js",
+        "format": "prettier --write .",
+        "format:check": "prettier --check .",
+        "lint": "eslint",
+        "lint:fix": "eslint --fix",
+        "test": "echo \"Error: oops, the Actor has no tests yet, sad!\" && exit 1",
+        "postinstall": "npx camoufox-js fetch"
+    },
+    "author": "Shahid Irfan",
+    "license": "Apache-2.0",
+    "keywords": [
+        "apify",
+        "scraper",
+        "naukri",
+        "jobs",
+        "employment",
+        "careers",
+        "job-search",
+        "job-listings",
+        "recruitment",
+        "india-jobs"
+    ]
+}

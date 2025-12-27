@@ -1,0 +1,11 @@
+{
+  "searchQuery": "sales",
+  "location": "Mumbai",
+  "maxJobs": 20,
+  "experience": "all",
+  "jobType": "all",
+  "sortBy": "relevance",
+  "proxyConfiguration": {
+    "useApifyProxy": true
+  }
+}

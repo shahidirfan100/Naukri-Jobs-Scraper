@@ -1,0 +1,30 @@
+{
+    "actorOutputSchemaVersion": 1,
+    "title": "Naukri Jobs Output",
+    "properties": {
+        "jobs": {
+            "type": "string",
+            "title": "Job Listings",
+            "description": "Complete job listings from Naukri.com with all details",
+            "template": "{{links.apiDefaultDatasetUrl}}/items?view=overview"
+        },
+        "jobsCSV": {
+            "type": "string",
+            "title": "Download as CSV",
+            "description": "Export jobs in CSV format",
+            "template": "{{links.apiDefaultDatasetUrl}}/items?format=csv"
+        },
+        "jobsJSON": {
+            "type": "string",
+            "title": "Download as JSON",
+            "description": "Export jobs in JSON format",
+            "template": "{{links.apiDefaultDatasetUrl}}/items?format=json"
+        },
+        "statistics": {
+            "type": "string",
+            "title": "Statistics",
+            "description": "Scraping statistics and summary",
+            "template": "{{links.apiDefaultKeyValueStoreUrl}}/keys/statistics"
+        }
+    }
+}
