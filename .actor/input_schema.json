@@ -76,6 +76,13 @@
                 "Internship"
             ]
         },
+        "fullPageDetails": {
+            "title": "Fetch Full Page Details",
+            "type": "boolean",
+            "description": "Enable to fetch complete job descriptions by opening each detail page with Playwright (slower but more reliable). Disable to only use JSON-LD data from listing pages (faster).",
+            "default": true,
+            "editor": "checkbox"
+        },
         "proxyConfiguration": {
             "title": "Proxy Configuration",
             "type": "object",
