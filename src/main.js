@@ -421,178 +421,106 @@ function parseJobPostingJsonLdCandidate(candidate) {
     };
 }
 /**
- * Fetch complete job description using Playwright context requests (Camoufox session)
- * Avoids Akamai blocks seen with plain HTTP clients by reusing the stealth browser session
+ * PLAYWRIGHT-ONLY description fetching
+ * Opens detail page with full Playwright navigation to maintain Camoufox stealth
+ * NO HTTP methods used - avoids all blocking
  */
-async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString = '', proxyUrl = '') {
+async function fetchFullDescription(jobUrl, page) {
+    const context = page.context();
+    let pageDetail = null;
     try {
-        const context = page.context();
-        const ua = userAgent || await page.evaluate(() => navigator.userAgent);
-        const cookies = cookieString || (await context.cookies()).map(c => `${c.name}=${c.value}`).join('; ');
-        const requestHeaders = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-IN,en-US;q=0.9,en;q=0.8',
-            'Cookie': cookies,
-            'User-Agent': ua,
-            'Referer': 'https://www.naukri.com/',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'same-origin',
-        };
-        // Fast path: use got-scraping (HTTP client) for speed; fallback to Playwright session on blocks.
-        let body = '';
-        try {
-            const gotOptions = {
-                url: jobUrl,
-                headers: requestHeaders,
-                http2: true,
-                timeout: { request: 15000 },
-                retry: { limit: 1 },
-            };
-            // Ensure got-scraping uses the same proxy/session IP when a proxy is configured.
-            // (Without this, Naukri may return a Next.js shell/404 and we won't see the JD HTML.)
-            if (proxyUrl) gotOptions.proxyUrl = proxyUrl;
-            const resp = await gotScraping(gotOptions);
-            if (resp.statusCode === 403 || resp.statusCode === 503 || resp.statusCode === 429) {
-                throw new Error(`blocked_http_${resp.statusCode}`);
-            }
-            if (resp.statusCode !== 200) {
-                log.debug(`Detail page returned status ${resp.statusCode}: ${jobUrl}`);
-                return null;
-            }
-            body = resp.body || '';
-        } catch (httpErr) {
-            // Fallback: Use the Playwright context request (shares Camoufox session)
-            const response = await context.request.get(jobUrl, {
-                headers: requestHeaders,
-                timeout: 20000,
-            });
-            const status = response.status();
-            if (status === 403 || status === 503 || status === 429) {
-                log.debug(`Block detected on detail page (${status}): ${jobUrl}`);
-                return { blocked: true };
-            }
-            if (status !== 200) {
-                log.debug(`Detail page returned status ${status}: ${jobUrl}`);
-                return null;
-            }
-            body = await response.text();
-        }
-        const $ = cheerio.load(body);
-        // Check if we got a challenge page
-        const title = $('title').text();
-        if (title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Security check')) {
-            log.debug(`Challenge page detected: ${jobUrl}`);
+        pageDetail = await context.newPage();
+        log.debug(`Opening: ${jobUrl}`);
+        await pageDetail.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await pageDetail.waitForTimeout(1500);
+        // Check for blocks
+        const title = await pageDetail.title();
+        if (/Just a moment|Access Denied|Cloudflare|Security check/i.test(title)) {
+            log.warning(`⚠ Blocked page: ${title}`);
+            await pageDetail.close();
             return { blocked: true };
         }
-        if (isLikelyNotFoundPage(title, $('body').text())) {
-            log.debug(`Detail page looks like 404/not-found: ${jobUrl}`);
+        // Try window state extraction first (fastest)
+        const windowData = await pageDetail.evaluate(() => {
+            try {
+                // Naukri stores data in __NEXT_DATA__
+                const nextData = window.__NEXT_DATA__;
+                if (nextData?.props?.pageProps?.job?.description) {
+                    return nextData.props.pageProps.job.description;
+                }
+                if (nextData?.props?.pageProps?.jobDetails?.description) {
+                    return nextData.props.pageProps.jobDetails.description;
+                }
+                // Also check raw jobData
+                if (window.jobData?.description) {
+                    return window.jobData.description;
+                }
+            } catch (e) { }
             return null;
+        }).catch(() => null);
+        if (windowData) {
+            const desc = String(windowData);
+            const isHtml = /<[^>]+>/.test(desc);
+            log.info(`✓ Window state (${desc.length} chars)`);
+            await pageDetail.close();
+            return {
+                descriptionHtml: isHtml ? desc : `<p>${desc}</p>`,
+                descriptionText: isHtml ? stripHtml(desc) : desc
+            };
         }
-        // Remove unwanted elements
-        $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
-        // Consolidated selectors for all attempts
-        const allSelectors = [
-            // Primary Naukri selectors (most likely to match)
+        // Parse page HTML with cheerio
+        const html = await pageDetail.content();
+        const $ = cheerio.load(html);
+        // Remove noise
+        $('script, style, noscript, .apply-button, .actions').remove();
+        // Try multiple selectors
+        const selectors = [
             'div[class*="JDC__dang-inner-html"]',
             'div[class*="dang-inner-html"]',
-            'div.styles_JDC__dang-inner-html__h0K4t',
-            'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
-            // Secondary selectors
-            'section[class*="job-desc"]',
-            'div[class*="jobDescription"]',
-            '[data-testid*="job-desc"]',
-            '[data-testid*="description"]',
             '[itemprop="description"]',
-            // Generic fallbacks
+            'section[class*="jobDesc"]',
             '.jd-desc',
             '.job-description',
-            '#job_description',
-            '#jobDescription',
+            '#jobDescriptionText',
         ];
-        log.debug(`Attempting extraction from: ${jobUrl}`);
-        // Step 1: Try clean HTML extraction
-        let description = extractCleanSectionFromCheerio($, allSelectors, 30);
-        // Step 2: Parse JSON-LD if HTML failed
-        let jsonLdJob = null;
+        // Try clean extraction
+        let description = extractCleanSectionFromCheerio($, selectors, 30);
+        // Try JSON-LD
         if (!description) {
-            log.debug('Trying JSON-LD extraction...');
             const jsonLdScripts = $('script[type="application/ld+json"]').map((_, el) => $(el).text()).get();
             for (const script of jsonLdScripts) {
                 try {
                     const data = JSON.parse(script);
-                    const candidates = Array.isArray(data) ? data : [data];
-                    for (const candidate of candidates) {
-                        if (!candidate) continue;
-                        if (candidate['@type'] === 'JobPosting') {
-                            jsonLdJob = parseJobPostingJsonLdCandidate(candidate);
-                            if (jsonLdJob?.descriptionText) break;
-                        }
-                        if (candidate['@graph']?.length) {
-                            for (const g of candidate['@graph']) {
-                                if (g?.['@type'] === 'JobPosting') {
-                                    jsonLdJob = parseJobPostingJsonLdCandidate(g);
-                                    if (jsonLdJob?.descriptionText) break;
-                                }
-                            }
+                    const items = Array.isArray(data) ? data : [data];
+                    for (const item of items) {
+                        if (item?.['@type'] === 'JobPosting' && item.description) {
+                            const desc = String(item.description);
+                            const isHtml = /<[^>]+>/.test(desc);
+                            log.info(`✓ JSON-LD (${desc.length} chars)`);
+                            await pageDetail.close();
+                            return {
+                                descriptionHtml: isHtml ? sanitizeHtmlFragment(desc) : `<p>${desc}</p>`,
+                                descriptionText: isHtml ? htmlToReadableText(desc) : desc
+                            };
                         }
                     }
-                    if (jsonLdJob?.descriptionText) break;
-                } catch (e) {
-                    log.debug(`JSON-LD parse error: ${e.message}`);
-                }
-            }
-            if (jsonLdJob?.descriptionText) {
-                description = {
-                    descriptionHtml: jsonLdJob.descriptionHtml,
-                    descriptionText: jsonLdJob.descriptionText
-                };
+                } catch (e) { }
             }
         }
-        // Step 3: Try RAW extraction (less processing)
+        // Try raw extraction
         if (!description) {
-            log.debug('Trying RAW extraction...');
-            description = extractRawDescription($, allSelectors);
+            description = extractRawDescription($, selectors);
         }
-        // Step 4: Last resort - Playwright rendering
-        if (!description) {
-            log.warning(`All HTTP-based methods failed for ${jobUrl}. Trying Playwright...`);
-            description = await fetchDescriptionViaPage(jobUrl, page);
+        await pageDetail.close();
+        if (description) {
+            log.info(`✓ DOM extraction (${description.descriptionText.length} chars)`);
+            return description;
         }
-        if (!description) {
-            log.error(`❌ Failed to extract description from ${jobUrl} with all methods`);
-            // Save debug HTML for analysis
-            const debugKey = `FAILED_PAGE_${Date.now()}_${jobUrl.split('/').pop()}`;
-            await Actor.setValue(debugKey, body, { contentType: 'text/html' });
-            log.info(`Saved failed page HTML to: ${debugKey}`);
-            return null;
-        }
-        log.info(`✓ Successfully extracted description (${description.descriptionText.length} chars) from ${jobUrl}`);
-        // Also try to extract additional job details from detail page - Naukri-specific
-        const experience = $('.exp-wrap .exp, .experience span, [class*="experience"]').first().text().trim() || '';
-        const salary = $('.salary-wrap .salary, .salary span, [class*="salary"]').first().text().trim() || '';
-        const jobType = $('.job-type, .employment-type, [class*="job-type"]').first().text().trim() || '';
-        const structured = jsonLdJob || {};
-        return {
-            descriptionHtml: description.descriptionHtml,
-            descriptionText: description.descriptionText,
-            experience: experience || structured.experience || null,
-            salary: salary || structured.salary || null,
-            jobType: jobType || structured.jobType || null,
-            title: structured.title || null,
-            company: structured.company || null,
-            location: structured.location || null,
-            postedDate: structured.postedDate || null,
-            tags: structured.tags || null,
-            jobId: structured.jobId || null,
-        };
+        log.warning(`❌ No description found: ${jobUrl}`);
+        return null;
     } catch (error) {
-        // Check if error is related to blocking
-        if (error.message && (error.message.includes('403') || error.message.includes('503'))) {
-            log.debug(`Block detected (error): ${jobUrl}`);
-            return { blocked: true };
-        }
-        log.debug(`Failed to fetch detail page ${jobUrl}: ${error.message}`);
+        log.error(`Error fetching ${jobUrl}: ${error.message}`);
+        if (pageDetail) await pageDetail.close().catch(() => { });
         return null;
     }
 }
