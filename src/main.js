@@ -224,7 +224,7 @@ function htmlToReadableText(html) {
         .trim();
 }
 
-function extractCleanSectionFromCheerio($, selectors, minTextLength = 10) {
+function extractCleanSectionFromCheerio($, selectors, minTextLength = 50) {
     for (const selector of selectors) {
         const el = $(selector).first();
         if (!el.length) continue;
@@ -312,15 +312,21 @@ function normalizeExperienceFromJsonLd(experienceRequirements) {
 async function fetchDescriptionViaPage(jobUrl, page) {
     const context = page.context();
     const primarySelectors = [
+        'div[class*="JDC__dang-inner-html"]',
         'div.styles_JDC__dang-inner-html__h0K4t',
+        'div[class*="dang-inner-html"]',
     ];
     const descriptionSelectors = [
+        'div[class*="JDC__dang-inner-html"]',
+        'div[class*="dang-inner-html"]',
         'div.styles_JDC__dang-inner-html__h0K4t',
         'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
         '.styles_JDC__dang-inner-html__h0K4t',
         '.styles_dang-inner-html___BCwh',
-        'div[class*="JDC__dang-inner-html"]',
-        'div[class*="dang-inner-html"]',
+        'section[class*="job-desc"]',
+        'div[class*="jobDescription"]',
+        '[data-testid*="job-desc"]',
+        '[data-testid*="description"]',
         '.jd-desc',
         '.job-description',
         '.job-desc',
@@ -349,14 +355,41 @@ async function fetchDescriptionViaPage(jobUrl, page) {
     const pageDetail = await context.newPage();
     try {
         await pageDetail.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        
+        // Try to extract from window state variables first
+        const windowState = await pageDetail.evaluate(() => {
+            try {
+                // Check for React/Next.js hydration data
+                if (window.__NEXT_DATA__?.props?.pageProps?.job?.description) {
+                    return { description: window.__NEXT_DATA__.props.pageProps.job.description };
+                }
+                // Check for other common state variables
+                if (window.jobData?.description) {
+                    return { description: window.jobData.description };
+                }
+            } catch (e) {
+                return null;
+            }
+            return null;
+        }).catch(() => null);
+
+        if (windowState?.description) {
+            const desc = String(windowState.description);
+            const isHtml = /<[^>]+>/.test(desc);
+            return {
+                descriptionHtml: isHtml ? desc : `<p>${desc}</p>`,
+                descriptionText: isHtml ? desc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : desc
+            };
+        }
+
         await pageDetail.waitForSelector(primarySelectors[0], { timeout: 8000 }).catch(() => {});
         await pageDetail.waitForTimeout(1200);
         const html = await pageDetail.content();
         const $ = cheerio.load(html);
         $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
 
-        let description = extractCleanSectionFromCheerio($, primarySelectors);
-        if (!description) description = extractCleanSectionFromCheerio($, descriptionSelectors);
+        let description = extractCleanSectionFromCheerio($, primarySelectors, 50);
+        if (!description) description = extractCleanSectionFromCheerio($, descriptionSelectors, 50);
         return description;
     } catch (err) {
         log.debug(`Detail page fallback fetch failed: ${err.message}`);
@@ -382,8 +415,22 @@ function parseJobPostingJsonLdCandidate(candidate) {
     const skills = Array.isArray(candidate.skills) ? candidate.skills.filter(Boolean).join(', ') : (candidate.skills || '');
 
     const descriptionRaw = candidate.description ? String(candidate.description) : '';
-    const descriptionHtml = descriptionRaw ? sanitizeHtmlFragment(descriptionRaw) : '';
-    const descriptionText = descriptionHtml ? htmlToReadableText(descriptionHtml) : '';
+    // Check if description contains HTML tags or is plain text
+    const isHtml = descriptionRaw && /<[^>]+>/.test(descriptionRaw);
+    let descriptionHtml = '';
+    let descriptionText = '';
+    
+    if (descriptionRaw) {
+        if (isHtml) {
+            // If it's HTML, sanitize and convert to text
+            descriptionHtml = sanitizeHtmlFragment(descriptionRaw);
+            descriptionText = htmlToReadableText(descriptionRaw);
+        } else {
+            // If it's plain text, wrap in paragraph tags
+            descriptionHtml = `<p>${descriptionRaw}</p>`;
+            descriptionText = descriptionRaw;
+        }
+    }
 
     return {
         title,
@@ -486,9 +533,11 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         // Remove source/apply buttons and unwanted elements
         $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
 
-        // Try JD selector first (user-provided selector)
+        // Try JD selector first (using partial class matching for resilience)
         const primarySelectors = [
+            'div[class*="JDC__dang-inner-html"]',
             'div.styles_JDC__dang-inner-html__h0K4t',
+            'div[class*="dang-inner-html"]',
         ];
 
         const extractedPrimary = extractCleanSectionFromCheerio($, primarySelectors);
@@ -530,13 +579,20 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         let description = descriptionFromHtml || descriptionFromJsonLd;
 
         // Try multiple selectors for job description on detail page - Naukri-specific
+        // Using partial class matching for resilience to hash changes
         const descriptionSelectors = [
+            'div[class*="JDC__dang-inner-html"]',
+            'div[class*="dang-inner-html"]',
             'div.styles_JDC__dang-inner-html__h0K4t',
             'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
             '.styles_JDC__dang-inner-html__h0K4t',
             '.styles_dang-inner-html___BCwh',
-            'div[class*="JDC__dang-inner-html"]',
-            'div[class*="dang-inner-html"]',
+            'section[class*="job-desc"]',
+            'div[class*="jobDescription"]',
+            '[data-testid*="job-desc"]',
+            '[data-testid*="description"]',
+            'section.job-detail article',
+            'div.job-content section',
             '.jd-desc',
             '.job-description',
             '.job-desc',
@@ -567,10 +623,16 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         }
         if (!description) {
             // Fallback: load detail with Playwright page (handles client-side rendered JD)
+            log.debug('HTTP extraction failed, trying Playwright page rendering...');
             description = await fetchDescriptionViaPage(jobUrl, page);
         }
 
-        if (!description) return null;
+        if (!description) {
+            log.warning(`❌ Failed to extract description from ${jobUrl} with all methods`);
+            // Save debug HTML for analysis
+            await Actor.setValue(`FAILED_PAGE_${Date.now()}`, body, { contentType: 'text/html' });
+            return null;
+        }
 
         // Also try to extract additional job details from detail page - Naukri-specific
         const experience = $('.exp-wrap .exp, .experience span, [class*="experience"]').first().text().trim() || '';
