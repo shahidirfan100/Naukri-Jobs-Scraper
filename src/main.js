@@ -198,15 +198,32 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
 
         // Try multiple selectors for job description on detail page - Naukri-specific
         const descriptionSelectors = [
+            'div.styles_JDC__dang-inner-html__h0K4t',
+            'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
+            '.styles_JDC__dang-inner-html__h0K4t',
+            '.styles_dang-inner-html___BCwh',
             '.jd-desc',
             '.job-description',
             '.job-desc',
+            '.job-details',
+            '.jd-cont',
+            '.jd-text',
+            '.description',
+            '.desc',
+            '.detail-contents',
+            '.dang-inner-html',
+            '.text-container',
+            '#job_description',
+            '#jobDescription',
+            '#jobDescriptionText',
+            '[class*="job-description"]',
+            '[class*="jd"]',
+            '[itemprop="description"]',
             'section[class*="jd"]',
             'div[class*="job-description"]',
             'article.jd-info',
             'section.content',
             '.job_description',
-            '#job_description',
             'article .desc',
         ];
 
@@ -238,12 +255,58 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
 
         // If no description found with specific selectors, try the main content area
         if (!descriptionText) {
-            const mainContent = $('main, article, .main-content, #main, .content');
+            const mainContent = $('main, article, .main-content, #main, .content, .jobPage');
             if (mainContent.length) {
                 // Remove navigation, header, footer, source elements
                 mainContent.find('nav, header, footer, .sidebar, .related-jobs, .similar-jobs, p.source, [data-source]').remove();
                 descriptionHtml = mainContent.html()?.trim() || '';
                 descriptionText = mainContent.text().trim();
+            }
+        }
+
+        // Try company/about blocks if still empty
+        if (!descriptionText) {
+            const aboutSelectors = [
+                'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
+                '.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
+                '.styles_dang-inner-html___BCwh',
+                '.about-company',
+                '.company-info',
+            ];
+            for (const selector of aboutSelectors) {
+                const aboutEl = $(selector).clone();
+                if (aboutEl.length && aboutEl.text().trim().length > 50) {
+                    descriptionHtml = aboutEl.html()?.trim() || '';
+                    descriptionText = aboutEl.text().trim();
+                    break;
+                }
+            }
+        }
+
+        // As a last resort, parse JSON-LD on the detail page for description
+        if (!descriptionText) {
+            const jsonLdScripts = $('script[type="application/ld+json"]').map((_, el) => $(el).text()).get();
+            for (const script of jsonLdScripts) {
+                try {
+                    const data = JSON.parse(script);
+                    if (data.description) {
+                        descriptionHtml = data.description;
+                        descriptionText = stripHtml(data.description);
+                        break;
+                    }
+                    if (Array.isArray(data)) {
+                        for (const item of data) {
+                            if (item.description) {
+                                descriptionHtml = item.description;
+                                descriptionText = stripHtml(item.description);
+                                break;
+                            }
+                        }
+                    }
+                } catch {
+                    // ignore parse errors
+                }
+                if (descriptionText) break;
             }
         }
 
@@ -1097,16 +1160,7 @@ try {
                     log.warning(`Direct API extraction failed: ${apiError.message}`);
                 }
 
-                // Strategy 2: JSON-LD fallback (if API fails)
-                if (jobs.length === 0) {
-                    jobs = await extractJobsViaJsonLD(page);
-                    if (jobs.length > 0) {
-                        extractionMethod = 'JSON-LD';
-                        log.info(`✓ JSON-LD extraction successful: ${jobs.length} jobs`);
-                    }
-                }
-
-                // Strategy 3: Fall back to HTML parsing with Cheerio
+                // Strategy 2: Fall back to HTML parsing with Cheerio (skip JSON-LD to save time)
                 if (jobs.length === 0) {
                     jobs = await extractJobDataViaHTML(page);
                     if (jobs.length > 0) {
@@ -1146,8 +1200,9 @@ try {
 
                     jobsToSave = uniqueJobs;
 
-                    // Enrich jobs with full descriptions only when needed to save time
-                    const needsEnrichment = jobsToSave.some(job => !job.descriptionText || job.descriptionText.length < 50);
+                    // Always enrich when HTML parsing was used or descriptions are short
+                    const needsEnrichment = extractionMethod !== 'Direct API' ||
+                        jobsToSave.some(job => !job.descriptionText || job.descriptionText.length < 50);
                     if (jobsToSave.length > 0 && needsEnrichment) {
                         log.info('Enriching jobs with full descriptions from detail pages...');
                         jobsToSave = await enrichJobsWithFullDescriptions(jobsToSave, page);
