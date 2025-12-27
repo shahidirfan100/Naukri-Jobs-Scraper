@@ -123,21 +123,21 @@ function parseJobPosting(jobData) {
  */
 function extractExperience(text) {
     if (!text) return 'Not specified';
-    
+
     const expMatch = text.match(/(\d+)[\s-]+(?:to|-)[\s]*(\d+)[\s]*(?:years?|yrs?)/i);
     if (expMatch) {
         return `${expMatch[1]}-${expMatch[2]} years`;
     }
-    
+
     const singleMatch = text.match(/(\d+)[\s]*(?:\+)?[\s]*(?:years?|yrs?)/i);
     if (singleMatch) {
         return `${singleMatch[1]}+ years`;
     }
-    
+
     if (text.toLowerCase().includes('fresher')) {
         return '0-1 years';
     }
-    
+
     return 'Not specified';
 }
 
@@ -224,28 +224,53 @@ function htmlToReadableText(html) {
         .trim();
 }
 
-function extractCleanSectionFromCheerio($, selectors, minTextLength = 50) {
+function extractCleanSectionFromCheerio($, selectors, minTextLength = 30) {
     for (const selector of selectors) {
         const el = $(selector).first();
         if (!el.length) continue;
 
         const rawText = el.text().trim();
-        if (!rawText) continue;
+        if (!rawText || rawText.length < minTextLength) continue;
 
         const rawHtml = el.html()?.trim() || '';
+        if (!rawHtml) continue;
+
         const sanitizedHtml = sanitizeHtmlFragment(rawHtml);
-        if (!sanitizedHtml) continue;
-        if (sanitizedHtml.length > 120000) continue;
+        if (!sanitizedHtml || sanitizedHtml.length > 120000) continue;
+
         const loweredHtml = sanitizedHtml.toLowerCase();
         if (loweredHtml.includes('__next_f') || loweredHtml.includes('static.naukimg.com') || loweredHtml.includes('_next/static')) {
             continue;
         }
 
         const text = htmlToReadableText(sanitizedHtml);
-        if (/this page could not be found|checking your browser|just a moment/i.test(text)) continue;
+        if (/this page could not be found|checking your browser|just a moment/i.test(text)) {
+            continue;
+        }
 
         if (text && text.length >= minTextLength) {
+            log.info(`✓ Description found: ${selector} (${text.length} chars)`);
             return { descriptionHtml: sanitizedHtml, descriptionText: text };
+        }
+    }
+    return null;
+}
+
+// Simple raw extraction without sanitization - fallback when clean method fails
+function extractRawDescription($, selectors) {
+    for (const selector of selectors) {
+        const el = $(selector).first();
+        if (!el.length) continue;
+
+        const rawHtml = el.html()?.trim() || '';
+        const rawText = el.text().trim();
+
+        if (rawText && rawText.length >= 100 && rawHtml) {
+            log.info(`✓ RAW description: ${selector} (${rawText.length} chars)`);
+            return {
+                descriptionHtml: rawHtml,
+                descriptionText: rawText
+            };
         }
     }
     return null;
@@ -354,8 +379,9 @@ async function fetchDescriptionViaPage(jobUrl, page) {
 
     const pageDetail = await context.newPage();
     try {
+        log.debug(`Opening detail page with Playwright: ${jobUrl}`);
         await pageDetail.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        
+
         // Try to extract from window state variables first
         const windowState = await pageDetail.evaluate(() => {
             try {
@@ -382,20 +408,31 @@ async function fetchDescriptionViaPage(jobUrl, page) {
             };
         }
 
-        await pageDetail.waitForSelector(primarySelectors[0], { timeout: 8000 }).catch(() => {});
+        await pageDetail.waitForSelector(primarySelectors[0], { timeout: 8000 }).catch(() => {
+            log.debug('Primary selector timeout, continuing...');
+        });
         await pageDetail.waitForTimeout(1200);
         const html = await pageDetail.content();
         const $ = cheerio.load(html);
         $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
 
+        log.debug('Trying primary selectors via Playwright...');
         let description = extractCleanSectionFromCheerio($, primarySelectors, 50);
-        if (!description) description = extractCleanSectionFromCheerio($, descriptionSelectors, 50);
+        if (!description) {
+            log.debug('Trying fallback selectors via Playwright...');
+            description = extractCleanSectionFromCheerio($, descriptionSelectors, 50);
+        }
+
+        if (description) {
+            log.info(`✓ Successfully extracted via Playwright page (${description.descriptionText.length} chars)`);
+        }
+
         return description;
     } catch (err) {
         log.debug(`Detail page fallback fetch failed: ${err.message}`);
         return null;
     } finally {
-        await pageDetail.close().catch(() => {});
+        await pageDetail.close().catch(() => { });
     }
 }
 
@@ -419,7 +456,7 @@ function parseJobPostingJsonLdCandidate(candidate) {
     const isHtml = descriptionRaw && /<[^>]+>/.test(descriptionRaw);
     let descriptionHtml = '';
     let descriptionText = '';
-    
+
     if (descriptionRaw) {
         if (isHtml) {
             // If it's HTML, sanitize and convert to text
@@ -530,109 +567,99 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
             return null;
         }
 
-        // Remove source/apply buttons and unwanted elements
+        // Remove unwanted elements
         $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
 
-        // Try JD selector first (using partial class matching for resilience)
-        const primarySelectors = [
-            'div[class*="JDC__dang-inner-html"]',
-            'div.styles_JDC__dang-inner-html__h0K4t',
-            'div[class*="dang-inner-html"]',
-        ];
-
-        const extractedPrimary = extractCleanSectionFromCheerio($, primarySelectors);
-
-        // Parse JSON-LD JobPosting (contains description + other structured fields)
-        const jsonLdScripts = $('script[type="application/ld+json"]').map((_, el) => $(el).text()).get();
-        let jsonLdJob = null;
-        for (const script of jsonLdScripts) {
-            try {
-                const data = JSON.parse(script);
-                const candidates = [];
-                if (Array.isArray(data)) candidates.push(...data);
-                else candidates.push(data);
-
-                for (const candidate of candidates) {
-                    if (!candidate) continue;
-                    if (!jsonLdJob && candidate['@type'] === 'JobPosting') {
-                        jsonLdJob = parseJobPostingJsonLdCandidate(candidate);
-                    }
-                    if (candidate['@graph'] && Array.isArray(candidate['@graph'])) {
-                        for (const g of candidate['@graph']) {
-                            if (!jsonLdJob && g && g['@type'] === 'JobPosting') {
-                                jsonLdJob = parseJobPostingJsonLdCandidate(g);
-                            }
-                        }
-                    }
-                }
-            } catch {
-                // ignore parse errors
-            }
-        }
-
-        const descriptionFromHtml = extractedPrimary?.descriptionText ? extractedPrimary : null;
-        const descriptionFromJsonLd = jsonLdJob?.descriptionText
-            ? { descriptionHtml: jsonLdJob.descriptionHtml, descriptionText: jsonLdJob.descriptionText }
-            : null;
-
-        // Prefer JD selector output; fallback to JSON-LD; then fallback to other selectors.
-        let description = descriptionFromHtml || descriptionFromJsonLd;
-
-        // Try multiple selectors for job description on detail page - Naukri-specific
-        // Using partial class matching for resilience to hash changes
-        const descriptionSelectors = [
+        // Consolidated selectors for all attempts
+        const allSelectors = [
+            // Primary Naukri selectors (most likely to match)
             'div[class*="JDC__dang-inner-html"]',
             'div[class*="dang-inner-html"]',
             'div.styles_JDC__dang-inner-html__h0K4t',
             'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
-            '.styles_JDC__dang-inner-html__h0K4t',
-            '.styles_dang-inner-html___BCwh',
+            // Secondary selectors
             'section[class*="job-desc"]',
             'div[class*="jobDescription"]',
             '[data-testid*="job-desc"]',
             '[data-testid*="description"]',
-            'section.job-detail article',
-            'div.job-content section',
+            '[itemprop="description"]',
+            // Generic fallbacks
             '.jd-desc',
             '.job-description',
-            '.job-desc',
-            '.job-details',
-            '.jd-cont',
-            '.jd-text',
-            '.description',
-            '.desc',
-            '.detail-contents',
-            '.dang-inner-html',
-            '.text-container',
             '#job_description',
             '#jobDescription',
-            '#jobDescriptionText',
-            '[class*="job-description"]',
-            '[class*="jd"]',
-            '[itemprop="description"]',
-            'section[class*="jd"]',
-            'div[class*="job-description"]',
-            'article.jd-info',
-            'section.content',
-            '.job_description',
-            'article .desc',
         ];
 
+        log.debug(`Attempting extraction from: ${jobUrl}`);
+
+        // Step 1: Try clean HTML extraction
+        let description = extractCleanSectionFromCheerio($, allSelectors, 30);
+
+
+        // Step 2: Parse JSON-LD if HTML failed
+        let jsonLdJob = null;
         if (!description) {
-            description = extractCleanSectionFromCheerio($, descriptionSelectors);
+            log.debug('Trying JSON-LD extraction...');
+            const jsonLdScripts = $('script[type="application/ld+json"]').map((_, el) => $(el).text()).get();
+
+            for (const script of jsonLdScripts) {
+                try {
+                    const data = JSON.parse(script);
+                    const candidates = Array.isArray(data) ? data : [data];
+
+                    for (const candidate of candidates) {
+                        if (!candidate) continue;
+
+                        if (candidate['@type'] === 'JobPosting') {
+                            jsonLdJob = parseJobPostingJsonLdCandidate(candidate);
+                            if (jsonLdJob?.descriptionText) break;
+                        }
+
+                        if (candidate['@graph']?.length) {
+                            for (const g of candidate['@graph']) {
+                                if (g?.['@type'] === 'JobPosting') {
+                                    jsonLdJob = parseJobPostingJsonLdCandidate(g);
+                                    if (jsonLdJob?.descriptionText) break;
+                                }
+                            }
+                        }
+                    }
+                    if (jsonLdJob?.descriptionText) break;
+                } catch (e) {
+                    log.debug(`JSON-LD parse error: ${e.message}`);
+                }
+            }
+
+            if (jsonLdJob?.descriptionText) {
+                description = {
+                    descriptionHtml: jsonLdJob.descriptionHtml,
+                    descriptionText: jsonLdJob.descriptionText
+                };
+            }
         }
+
+        // Step 3: Try RAW extraction (less processing)
         if (!description) {
-            // Fallback: load detail with Playwright page (handles client-side rendered JD)
-            log.debug('HTTP extraction failed, trying Playwright page rendering...');
+            log.debug('Trying RAW extraction...');
+            description = extractRawDescription($, allSelectors);
+        }
+
+        // Step 4: Last resort - Playwright rendering
+        if (!description) {
+            log.warning(`All HTTP-based methods failed for ${jobUrl}. Trying Playwright...`);
             description = await fetchDescriptionViaPage(jobUrl, page);
         }
 
         if (!description) {
-            log.warning(`❌ Failed to extract description from ${jobUrl} with all methods`);
+            log.error(`❌ Failed to extract description from ${jobUrl} with all methods`);
             // Save debug HTML for analysis
-            await Actor.setValue(`FAILED_PAGE_${Date.now()}`, body, { contentType: 'text/html' });
+            const debugKey = `FAILED_PAGE_${Date.now()}_${jobUrl.split('/').pop()}`;
+            await Actor.setValue(debugKey, body, { contentType: 'text/html' });
+            log.info(`Saved failed page HTML to: ${debugKey}`);
             return null;
         }
+
+        log.info(`✓ Successfully extracted description (${description.descriptionText.length} chars) from ${jobUrl}`);
 
         // Also try to extract additional job details from detail page - Naukri-specific
         const experience = $('.exp-wrap .exp, .experience span, [class*="experience"]').first().text().trim() || '';
@@ -688,20 +715,25 @@ async function enrichJobsWithFullDescriptions(jobs, page, proxyUrl = '', maxConc
     for (let i = 0; i < jobs.length; i += batchSize) {
         const batch = jobs.slice(i, i + batchSize);
 
-        const batchPromises = batch.map(async (job) => {
-            if (!job.url) return job;
+        const batchPromises = batch.map(async (job, idx) => {
+            if (!job.url) {
+                log.debug(`Job ${i + idx + 1} has no URL, skipping...`);
+                return job;
+            }
 
+            log.debug(`Fetching description for job ${i + idx + 1}/${jobs.length}: ${job.url}`);
             const fullDesc = await fetchFullDescription(job.url, page, userAgent, cookieString, proxyUrl);
 
             // Check if we got blocked
             if (fullDesc && fullDesc.blocked) {
                 blockedCount++;
-                log.warning(`Detail page blocked: ${job.url}`);
+                log.warning(`⚠️  Detail page blocked: ${job.url}`);
                 // Return job with original snippet - don't fail the entire batch
                 return job;
             }
 
             if (fullDesc && (fullDesc.descriptionText || fullDesc.descriptionHtml)) {
+                log.info(`✓ Enriched job ${i + idx + 1} with full description (${fullDesc.descriptionText?.length || 0} chars)`);
                 return {
                     ...job,
                     title: fullDesc.title || job.title,
@@ -718,6 +750,8 @@ async function enrichJobsWithFullDescriptions(jobs, page, proxyUrl = '', maxConc
                 };
             }
 
+            // No description found, use original job data
+            log.warning(`✗ No description found for job ${i + idx + 1}: ${job.url}`);
             return job;
         });
 
@@ -815,7 +849,7 @@ function buildSearchUrl(input) {
     const query = (input.searchQuery || 'sales').toLowerCase().trim().replace(/\s+/g, '-');
     const locationRaw = (input.location || '').toLowerCase().trim();
     const location = locationRaw ? locationRaw.replace(/\s+/g, '-') : '';
-    
+
     let baseUrl = location
         ? `https://www.naukri.com/${query}-jobs-in-${location}`
         : `https://www.naukri.com/${query}-jobs`;
@@ -872,7 +906,7 @@ async function extractJobDataViaHTML(page) {
                 'div[class*="srp"]',
                 'article.row'
             ];
-            
+
             for (const selector of fallbackSelectors) {
                 const elements = $(selector);
                 if (elements.length > 0) {
@@ -962,7 +996,7 @@ function extractJobFromElement($, $el, fallback = {}) {
             'h2 a, h3 a',
             '.row1 a'
         ];
-        
+
         for (const sel of titleSelectors) {
             const titleEl = $el.find(sel).first();
             if (titleEl.length && titleEl.text().trim()) {
@@ -982,7 +1016,7 @@ function extractJobFromElement($, $el, fallback = {}) {
             'h2 a, h3 a',
             '.row1 a'
         ];
-        
+
         for (const sel of urlSelectors) {
             const urlEl = $el.find(sel).first();
             if (urlEl.length && urlEl.attr('href')) {
@@ -1029,7 +1063,7 @@ function extractJobFromElement($, $el, fallback = {}) {
             'span[class*="comp"]',
             'a[href*="company"]',
         ];
-        
+
         for (const sel of companySelectors) {
             const compEl = $el.find(sel).first();
             if (compEl.length && compEl.text().trim()) {
@@ -1047,7 +1081,7 @@ function extractJobFromElement($, $el, fallback = {}) {
             '.row3 .location',
             '[class*="loc"]',
         ];
-        
+
         for (const sel of locationSelectors) {
             const locEl = $el.find(sel).first();
             if (locEl.length && locEl.text().trim()) {
@@ -1063,7 +1097,7 @@ function extractJobFromElement($, $el, fallback = {}) {
             'span[class*="exp"]',
             '.row4 .exp'
         ];
-        
+
         for (const sel of expSelectors) {
             const expEl = $el.find(sel).first();
             if (expEl.length && expEl.text().trim()) {
@@ -1079,7 +1113,7 @@ function extractJobFromElement($, $el, fallback = {}) {
             'span[class*="sal"]',
             '.row5 .salary'
         ];
-        
+
         for (const sel of salarySelectors) {
             const salEl = $el.find(sel).first();
             if (salEl.length && salEl.text().trim()) {
@@ -1102,7 +1136,7 @@ function extractJobFromElement($, $el, fallback = {}) {
             'span[class*="posted"]',
             '.postedDate'
         ];
-        
+
         for (const sel of dateSelectors) {
             const dateEl = $el.find(sel).first();
             if (dateEl.length && dateEl.text().trim()) {
