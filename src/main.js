@@ -716,6 +716,7 @@ async function extractJobDataViaHTML(page) {
         const html = await page.content();
         const $ = cheerio.load(html);
         const jobs = [];
+        const seenUrls = new Set();
 
         // Naukri-specific selectors for job cards
         // Primary selector: "tuple"/"jobTuple" blocks
@@ -750,11 +751,17 @@ async function extractJobDataViaHTML(page) {
                         if (tuples.length) {
                             tuples.each((_, tupleEl) => {
                                 const job = extractJobFromElement($, $(tupleEl));
-                                if (job) jobs.push(job);
+                                if (job && job.url && !seenUrls.has(job.url)) {
+                                    seenUrls.add(job.url);
+                                    jobs.push(job);
+                                }
                             });
                         } else {
                             const job = extractJobFromElement($, container);
-                            if (job) jobs.push(job);
+                            if (job && job.url && !seenUrls.has(job.url)) {
+                                seenUrls.add(job.url);
+                                jobs.push(job);
+                            }
                         }
                     });
                     if (jobs.length > 0) break;
@@ -763,8 +770,38 @@ async function extractJobDataViaHTML(page) {
         } else {
             jobElements.each((_, element) => {
                 const job = extractJobFromElement($, $(element));
-                if (job) jobs.push(job);
+                if (job && job.url && !seenUrls.has(job.url)) {
+                    seenUrls.add(job.url);
+                    jobs.push(job);
+                }
             });
+        }
+
+        // If tuple-based parsing failed, fall back to job listing links and climb up to their containers
+        if (jobs.length === 0) {
+            const jobLinkEls = $('a[href*="job-listings"], a[href^="/job-listings"]').toArray();
+            log.info(`Fallback: Found ${jobLinkEls.length} job listing links`);
+
+            for (const el of jobLinkEls) {
+                const $link = $(el);
+                const href = $link.attr('href') || '';
+                if (!href) continue;
+
+                const absoluteUrl = href.startsWith('http') ? href : `https://www.naukri.com${href}`;
+                if (seenUrls.has(absoluteUrl)) continue;
+
+                const titleFromLink = ($link.text() || $link.attr('title') || '').trim();
+                const container = $link.closest('article, div');
+                const job = extractJobFromElement($, container.length ? container : $link.parent(), {
+                    title: titleFromLink,
+                    url: absoluteUrl,
+                });
+
+                if (job && job.url && !seenUrls.has(job.url)) {
+                    seenUrls.add(job.url);
+                    jobs.push(job);
+                }
+            }
         }
 
         log.info(`Extracted ${jobs.length} jobs via HTML parsing`);
@@ -779,11 +816,13 @@ async function extractJobDataViaHTML(page) {
 /**
  * Extract job data from a single job element using Naukri-specific selectors
  */
-function extractJobFromElement($, $el) {
+function extractJobFromElement($, $el, fallback = {}) {
     try {
         // Job Title - multiple possible selectors
         let title = '';
         const titleSelectors = [
+            'a[href*="job-listings"]',
+            'a[href^="/job-listings"]',
             'a.title, .title a',
             'a.subtitle, .subtitle a',
             'a[class*="title"]',
@@ -802,6 +841,8 @@ function extractJobFromElement($, $el) {
         // Job URL
         let url = '';
         const urlSelectors = [
+            'a[href*="job-listings"]',
+            'a[href^="/job-listings"]',
             'a.title',
             'a.subtitle',
             'a[class*="title"]',
@@ -819,6 +860,10 @@ function extractJobFromElement($, $el) {
                 break;
             }
         }
+
+        // Fallback to link-provided title/url when selectors fail
+        if (!title && fallback.title) title = fallback.title;
+        if (!url && fallback.url) url = fallback.url;
 
         // Company name
         let company = '';
