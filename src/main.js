@@ -149,6 +149,108 @@ function stripHtml(html) {
     return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+function isLikelyNotFoundPage(titleText, bodyText) {
+    const title = (titleText || '').toLowerCase();
+    const body = (bodyText || '').toLowerCase();
+    return title.includes('404') || body.includes('this page could not be found') || body.includes('page could not be found');
+}
+
+function sanitizeHtmlFragment(html) {
+    if (!html) return '';
+    const $ = cheerio.load(`<div id="__root">${html}</div>`);
+    const root = $('#__root');
+
+    // Remove noisy/unsafe content
+    root.find('script, style, noscript, svg, img, iframe, canvas, form, input, button, link, meta').remove();
+
+    // Keep only a small allowlist of semantic tags; unwrap everything else
+    const allowedTags = new Set(['p', 'ul', 'ol', 'li', 'br', 'strong', 'b', 'em', 'i', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a']);
+    root.find('*').each((_, el) => {
+        const tag = (el.tagName || '').toLowerCase();
+        if (!tag || allowedTags.has(tag)) return;
+        $(el).replaceWith($(el).contents());
+    });
+
+    // Remove event handlers + styling attributes + classes/ids
+    root.find('*').each((_, el) => {
+        const attribs = el.attribs || {};
+        for (const name of Object.keys(attribs)) {
+            const lower = name.toLowerCase();
+            if (lower === 'href') continue; // keep links
+            if (lower.startsWith('on')) {
+                $(el).removeAttr(name);
+                continue;
+            }
+            $(el).removeAttr(name);
+        }
+    });
+
+    // Remove empty nodes
+    root.find('*').each((_, el) => {
+        const $el = $(el);
+        if ($el.children().length === 0 && !$el.text().trim()) $el.remove();
+    });
+
+    return root.html()?.trim() || '';
+}
+
+function htmlToReadableText(html) {
+    if (!html) return '';
+    const $ = cheerio.load(`<div id="__root">${html}</div>`);
+    const root = $('#__root');
+
+    root.find('script, style, noscript, svg, img, iframe, canvas, form, input, button, link, meta').remove();
+
+    const lines = [];
+    root.find('h1,h2,h3,h4,h5,h6,p,li').each((_, el) => {
+        const tag = (el.tagName || '').toLowerCase();
+        const t = $(el).text().trim();
+        if (!t) return;
+        if (tag === 'li') lines.push(`- ${t}`);
+        else lines.push(t);
+    });
+
+    // Fallback if no semantic blocks present
+    if (lines.length === 0) {
+        const t = root.text().trim();
+        if (t) lines.push(t);
+    }
+
+    return lines
+        .join('\n')
+        .replace(/\r/g, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function extractCleanSectionFromCheerio($, selectors, minTextLength = 30) {
+    for (const selector of selectors) {
+        const el = $(selector).first();
+        if (!el.length) continue;
+
+        const rawText = el.text().trim();
+        if (!rawText) continue;
+
+        const rawHtml = el.html()?.trim() || '';
+        const sanitizedHtml = sanitizeHtmlFragment(rawHtml);
+        if (!sanitizedHtml) continue;
+        if (sanitizedHtml.length > 120000) continue;
+        const loweredHtml = sanitizedHtml.toLowerCase();
+        if (loweredHtml.includes('__next_f') || loweredHtml.includes('static.naukimg.com') || loweredHtml.includes('_next/static')) {
+            continue;
+        }
+
+        const text = htmlToReadableText(sanitizedHtml);
+        if (/this page could not be found|checking your browser|just a moment/i.test(text)) continue;
+
+        if (text && text.length >= minTextLength) {
+            return { descriptionHtml: sanitizedHtml, descriptionText: text };
+        }
+    }
+    return null;
+}
+
 /**
  * Fetch complete job description using Playwright context requests (Camoufox session)
  * Avoids Akamai blocks seen with plain HTTP clients by reusing the stealth browser session
@@ -221,6 +323,11 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
             return { blocked: true };
         }
 
+        if (isLikelyNotFoundPage(title, $('body').text())) {
+            log.debug(`Detail page looks like 404/not-found: ${jobUrl}`);
+            return null;
+        }
+
         // Remove source/apply buttons and unwanted elements
         $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
 
@@ -236,16 +343,22 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
                 for (const candidate of candidates) {
                     if (!candidate) continue;
                     if (candidate['@type'] === 'JobPosting' && candidate.description) {
-                        const descriptionHtml = String(candidate.description);
-                        const descriptionText = stripHtml(descriptionHtml);
-                        return { descriptionHtml, descriptionText };
+                        const sanitizedHtml = sanitizeHtmlFragment(String(candidate.description));
+                        const descriptionText = htmlToReadableText(sanitizedHtml);
+                        const lowered = sanitizedHtml.toLowerCase();
+                        if (descriptionText && !lowered.includes('__next_f') && !lowered.includes('static.naukimg.com') && !lowered.includes('_next/static')) {
+                            return { descriptionHtml: sanitizedHtml, descriptionText };
+                        }
                     }
                     if (candidate['@graph'] && Array.isArray(candidate['@graph'])) {
                         for (const g of candidate['@graph']) {
                             if (g && g['@type'] === 'JobPosting' && g.description) {
-                                const descriptionHtml = String(g.description);
-                                const descriptionText = stripHtml(descriptionHtml);
-                                return { descriptionHtml, descriptionText };
+                                const sanitizedHtml = sanitizeHtmlFragment(String(g.description));
+                                const descriptionText = htmlToReadableText(sanitizedHtml);
+                                const lowered = sanitizedHtml.toLowerCase();
+                                if (descriptionText && !lowered.includes('__next_f') && !lowered.includes('static.naukimg.com') && !lowered.includes('_next/static')) {
+                                    return { descriptionHtml: sanitizedHtml, descriptionText };
+                                }
                             }
                         }
                     }
@@ -288,85 +401,18 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
             'article .desc',
         ];
 
-        let descriptionHtml = '';
-        let descriptionText = '';
-
-        for (const selector of descriptionSelectors) {
-            const descEl = $(selector).clone();
-            if (descEl.length && descEl.text().trim().length > 100) {
-                // Remove source elements before extraction
-                descEl.find('p.source, [data-source], .source').remove();
-
-                // Remove "Related Jobs" section - find and remove everything after headings containing "related"
-                descEl.find('h2, h3, h4').each((_, heading) => {
-                    const $heading = $(heading);
-                    const headingText = $heading.text().toLowerCase();
-                    if (headingText.includes('related') || headingText.includes('similar') || headingText.includes('recommended')) {
-                        // Remove this heading and all siblings after it
-                        $heading.nextAll().remove();
-                        $heading.remove();
-                    }
-                });
-
-                descriptionHtml = descEl.html()?.trim() || '';
-                descriptionText = descEl.text().trim();
-                break;
-            }
-        }
-
-        // If no description found with specific selectors, try the main content area
-        if (!descriptionText) {
-            const mainContent = $('main, article, .main-content, #main, .content, .jobPage');
-            if (mainContent.length) {
-                // Remove navigation, header, footer, source elements
-                mainContent.find('nav, header, footer, .sidebar, .related-jobs, .similar-jobs, p.source, [data-source]').remove();
-                descriptionHtml = mainContent.html()?.trim() || '';
-                descriptionText = mainContent.text().trim();
-            }
-        }
-
-        // Try company/about blocks if still empty
-        if (!descriptionText) {
-            const aboutSelectors = [
-                'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
-                '.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
-                '.styles_dang-inner-html___BCwh',
-                'div[class*="styles_detail__"][class*="dang-inner-html"]',
-                '.about-company',
-                '.company-info',
-            ];
-            for (const selector of aboutSelectors) {
-                const aboutEl = $(selector).clone();
-                if (aboutEl.length && aboutEl.text().trim().length > 50) {
-                    descriptionHtml = aboutEl.html()?.trim() || '';
-                    descriptionText = aboutEl.text().trim();
-                    break;
-                }
-            }
-        }
-
-        // As a last resort, use the full body text if something went wrong with selectors.
-        if (!descriptionText) {
-            const bodyText = $('body').text().trim();
-            if (bodyText.length > 0) {
-                descriptionText = bodyText;
-                descriptionHtml = $('body').html()?.trim() || '';
-            }
-        }
-
-        // Clean description - remove source paragraph pattern
-        descriptionHtml = descriptionHtml.replace(/<p[^>]*class="source"[^>]*>.*?<\/p>/gi, '');
-        descriptionHtml = descriptionHtml.replace(/<p[^>]*data-source[^>]*>.*?<\/p>/gi, '');
+        const extractedDescription = extractCleanSectionFromCheerio($, descriptionSelectors);
+        if (!extractedDescription) return null;
 
         // Also try to extract additional job details from detail page - Naukri-specific
         const experience = $('.exp-wrap .exp, .experience span, [class*="experience"]').first().text().trim() || '';
         const salary = $('.salary-wrap .salary, .salary span, [class*="salary"]').first().text().trim() || '';
         const jobType = $('.job-type, .employment-type, [class*="job-type"]').first().text().trim() || '';
 
-        if (descriptionText && descriptionText.length > 0) {
+        if (extractedDescription.descriptionText) {
             return {
-                descriptionHtml,
-                descriptionText,
+                descriptionHtml: extractedDescription.descriptionHtml,
+                descriptionText: extractedDescription.descriptionText,
                 experience: experience || null,
                 salary: salary || null,
                 jobType: jobType || null,
