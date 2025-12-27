@@ -565,7 +565,7 @@ async function enrichJobsWithFullDescriptions(jobs, page, fullPageDetails = true
         }
         // Small delay between requests
         if (i < jobs.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
     }
     if (blockedCount > 0) {
@@ -999,31 +999,18 @@ try {
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
         maxRequestsPerCrawl,
-        maxConcurrency: 3, // Increased for faster scraping
-        navigationTimeoutSecs: 30, // Reduced for speed
-        requestHandlerTimeoutSecs: 120, // Reduced but enough for enrichment
+        maxConcurrency: 3,
+        navigationTimeoutSecs: 60, // First page needs more time due to Camoufox startup
+        requestHandlerTimeoutSecs: 300, // 5 minutes for full enrichment of batch
+        retryOnBlocked: true,
         launchContext: {
             launcher: firefox,
             launchOptions: await camoufoxLaunchOptions({
-                // Headless mode - must be boolean for Crawlee/Playwright
                 headless: true,
-                // Proxy configuration - use residential proxy for trusted IP
                 proxy: proxyUrl,
-                // GeoIP spoofing - matches location/timezone/locale to proxy IP
-                // This is critical for anti-bot bypass
                 geoip: true,
-                // OS fingerprint - Windows is most common and least suspicious
                 os: 'windows',
-                // Locale and language settings - match India for Naukri
                 locale: 'en-IN',
-                // Screen constraints for realistic viewport
-                // Avoid fixed sizes as they can be fingerprinted
-                screen: {
-                    minWidth: 1024,
-                    maxWidth: 1920,
-                    minHeight: 768,
-                    maxHeight: 1080,
-                },
             }),
         },
         async requestHandler({ page, request }) {
