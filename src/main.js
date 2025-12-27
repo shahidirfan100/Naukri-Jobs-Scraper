@@ -251,11 +251,103 @@ function extractCleanSectionFromCheerio($, selectors, minTextLength = 30) {
     return null;
 }
 
+function normalizeLocationFromJsonLd(jobLocation) {
+    if (!jobLocation) return '';
+
+    const locations = [];
+    const addLocation = (loc) => {
+        if (!loc) return;
+        if (typeof loc === 'string') {
+            const t = loc.trim();
+            if (t) locations.push(t);
+            return;
+        }
+
+        const address = loc.address || loc;
+        const locality = address.addressLocality;
+        const region = address.addressRegion;
+        const country = address.addressCountry;
+
+        const parts = [];
+        if (Array.isArray(locality)) parts.push(locality.filter(Boolean).join(', '));
+        else if (locality) parts.push(locality);
+        if (region) parts.push(region);
+        if (country) parts.push(country);
+
+        const t = parts.filter(Boolean).join(', ').trim();
+        if (t) locations.push(t);
+    };
+
+    if (Array.isArray(jobLocation)) jobLocation.forEach(addLocation);
+    else addLocation(jobLocation);
+
+    return [...new Set(locations)].join(' | ');
+}
+
+function normalizeSalaryFromJsonLd(baseSalary) {
+    if (!baseSalary) return '';
+    if (typeof baseSalary === 'string') return baseSalary.trim();
+    if (typeof baseSalary.value === 'string') return baseSalary.value.trim();
+    if (baseSalary.value && typeof baseSalary.value === 'object') {
+        const min = baseSalary.value.minValue ?? baseSalary.value.value ?? '';
+        const max = baseSalary.value.maxValue ?? '';
+        const currency = baseSalary.currency ?? '';
+        const unit = baseSalary.value.unitText ?? '';
+        return [min && max ? `${min}-${max}` : `${min}${max ? `-${max}` : ''}`, currency, unit].filter(Boolean).join(' ').trim();
+    }
+    return '';
+}
+
+function normalizeExperienceFromJsonLd(experienceRequirements) {
+    if (!experienceRequirements) return '';
+    if (typeof experienceRequirements === 'string') return experienceRequirements.trim();
+    const months = experienceRequirements.monthsOfExperience ?? experienceRequirements.months ?? null;
+    if (months == null) return '';
+    const m = Number(months);
+    if (!Number.isFinite(m) || m <= 0) return '';
+    const years = Math.max(0, Math.round((m / 12) * 10) / 10);
+    return `${years} years`;
+}
+
+function parseJobPostingJsonLdCandidate(candidate) {
+    if (!candidate || candidate['@type'] !== 'JobPosting') return null;
+
+    const title = candidate.title || candidate.name || '';
+    const jobId = candidate.identifier?.value || candidate.identifier?.name || '';
+    const company = candidate.hiringOrganization?.name || '';
+    const location = normalizeLocationFromJsonLd(candidate.jobLocation);
+    const postedDate = candidate.datePosted || '';
+    const jobType = Array.isArray(candidate.employmentType)
+        ? candidate.employmentType.filter(Boolean).join(', ')
+        : (candidate.employmentType || '');
+    const experience = normalizeExperienceFromJsonLd(candidate.experienceRequirements);
+    const salary = normalizeSalaryFromJsonLd(candidate.baseSalary);
+    const skills = Array.isArray(candidate.skills) ? candidate.skills.filter(Boolean).join(', ') : (candidate.skills || '');
+
+    const descriptionRaw = candidate.description ? String(candidate.description) : '';
+    const descriptionHtml = descriptionRaw ? sanitizeHtmlFragment(descriptionRaw) : '';
+    const descriptionText = descriptionHtml ? htmlToReadableText(descriptionHtml) : '';
+
+    return {
+        title,
+        company,
+        location,
+        postedDate,
+        jobType,
+        experience,
+        salary,
+        tags: skills,
+        jobId,
+        descriptionHtml,
+        descriptionText,
+    };
+}
+
 /**
  * Fetch complete job description using Playwright context requests (Camoufox session)
  * Avoids Akamai blocks seen with plain HTTP clients by reusing the stealth browser session
  */
-async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString = '') {
+async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString = '', proxyUrl = '') {
     try {
         const context = page.context();
         const ua = userAgent || await page.evaluate(() => navigator.userAgent);
@@ -275,13 +367,19 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         // Fast path: use got-scraping (HTTP client) for speed; fallback to Playwright session on blocks.
         let body = '';
         try {
-            const resp = await gotScraping({
+            const gotOptions = {
                 url: jobUrl,
                 headers: requestHeaders,
                 http2: true,
                 timeout: { request: 15000 },
                 retry: { limit: 1 },
-            });
+            };
+
+            // Ensure got-scraping uses the same proxy/session IP when a proxy is configured.
+            // (Without this, Naukri may return a Next.js shell/404 and we won't see the JD HTML.)
+            if (proxyUrl) gotOptions.proxyUrl = proxyUrl;
+
+            const resp = await gotScraping(gotOptions);
 
             if (resp.statusCode === 403 || resp.statusCode === 503 || resp.statusCode === 429) {
                 throw new Error(`blocked_http_${resp.statusCode}`);
@@ -331,8 +429,16 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         // Remove source/apply buttons and unwanted elements
         $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
 
-        // Prefer JSON-LD JobPosting description if present (usually the most complete)
+        // Try JD selector first (user-provided selector)
+        const primarySelectors = [
+            'div.styles_JDC__dang-inner-html__h0K4t',
+        ];
+
+        const extractedPrimary = extractCleanSectionFromCheerio($, primarySelectors);
+
+        // Parse JSON-LD JobPosting (contains description + other structured fields)
         const jsonLdScripts = $('script[type="application/ld+json"]').map((_, el) => $(el).text()).get();
+        let jsonLdJob = null;
         for (const script of jsonLdScripts) {
             try {
                 const data = JSON.parse(script);
@@ -342,23 +448,13 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
 
                 for (const candidate of candidates) {
                     if (!candidate) continue;
-                    if (candidate['@type'] === 'JobPosting' && candidate.description) {
-                        const sanitizedHtml = sanitizeHtmlFragment(String(candidate.description));
-                        const descriptionText = htmlToReadableText(sanitizedHtml);
-                        const lowered = sanitizedHtml.toLowerCase();
-                        if (descriptionText && !lowered.includes('__next_f') && !lowered.includes('static.naukimg.com') && !lowered.includes('_next/static')) {
-                            return { descriptionHtml: sanitizedHtml, descriptionText };
-                        }
+                    if (!jsonLdJob && candidate['@type'] === 'JobPosting') {
+                        jsonLdJob = parseJobPostingJsonLdCandidate(candidate);
                     }
                     if (candidate['@graph'] && Array.isArray(candidate['@graph'])) {
                         for (const g of candidate['@graph']) {
-                            if (g && g['@type'] === 'JobPosting' && g.description) {
-                                const sanitizedHtml = sanitizeHtmlFragment(String(g.description));
-                                const descriptionText = htmlToReadableText(sanitizedHtml);
-                                const lowered = sanitizedHtml.toLowerCase();
-                                if (descriptionText && !lowered.includes('__next_f') && !lowered.includes('static.naukimg.com') && !lowered.includes('_next/static')) {
-                                    return { descriptionHtml: sanitizedHtml, descriptionText };
-                                }
+                            if (!jsonLdJob && g && g['@type'] === 'JobPosting') {
+                                jsonLdJob = parseJobPostingJsonLdCandidate(g);
                             }
                         }
                     }
@@ -367,6 +463,14 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
                 // ignore parse errors
             }
         }
+
+        const descriptionFromHtml = extractedPrimary?.descriptionText ? extractedPrimary : null;
+        const descriptionFromJsonLd = jsonLdJob?.descriptionText
+            ? { descriptionHtml: jsonLdJob.descriptionHtml, descriptionText: jsonLdJob.descriptionText }
+            : null;
+
+        // Prefer JD selector output; fallback to JSON-LD; then fallback to other selectors.
+        let description = descriptionFromHtml || descriptionFromJsonLd;
 
         // Try multiple selectors for job description on detail page - Naukri-specific
         const descriptionSelectors = [
@@ -401,25 +505,30 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
             'article .desc',
         ];
 
-        const extractedDescription = extractCleanSectionFromCheerio($, descriptionSelectors);
-        if (!extractedDescription) return null;
+        if (!description) {
+            description = extractCleanSectionFromCheerio($, descriptionSelectors);
+        }
+        if (!description) return null;
 
         // Also try to extract additional job details from detail page - Naukri-specific
         const experience = $('.exp-wrap .exp, .experience span, [class*="experience"]').first().text().trim() || '';
         const salary = $('.salary-wrap .salary, .salary span, [class*="salary"]').first().text().trim() || '';
         const jobType = $('.job-type, .employment-type, [class*="job-type"]').first().text().trim() || '';
 
-        if (extractedDescription.descriptionText) {
-            return {
-                descriptionHtml: extractedDescription.descriptionHtml,
-                descriptionText: extractedDescription.descriptionText,
-                experience: experience || null,
-                salary: salary || null,
-                jobType: jobType || null,
-            };
-        }
-
-        return null;
+        const structured = jsonLdJob || {};
+        return {
+            descriptionHtml: description.descriptionHtml,
+            descriptionText: description.descriptionText,
+            experience: experience || structured.experience || null,
+            salary: salary || structured.salary || null,
+            jobType: jobType || structured.jobType || null,
+            title: structured.title || null,
+            company: structured.company || null,
+            location: structured.location || null,
+            postedDate: structured.postedDate || null,
+            tags: structured.tags || null,
+            jobId: structured.jobId || null,
+        };
     } catch (error) {
         // Check if error is related to blocking
         if (error.message && (error.message.includes('403') || error.message.includes('503'))) {
@@ -435,7 +544,7 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
  * Enrich jobs with full descriptions from detail pages
  * Uses session cookies from Camoufox to maintain Cloudflare bypass
  */
-async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 20) {
+async function enrichJobsWithFullDescriptions(jobs, page, proxyUrl = '', maxConcurrency = 20) {
     if (jobs.length === 0) return jobs;
 
     log.info(`Fetching full descriptions for ${jobs.length} jobs...`);
@@ -458,7 +567,7 @@ async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 20) {
         const batchPromises = batch.map(async (job) => {
             if (!job.url) return job;
 
-            const fullDesc = await fetchFullDescription(job.url, page, userAgent, cookieString);
+            const fullDesc = await fetchFullDescription(job.url, page, userAgent, cookieString, proxyUrl);
 
             // Check if we got blocked
             if (fullDesc && fullDesc.blocked) {
@@ -471,11 +580,17 @@ async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 20) {
             if (fullDesc && (fullDesc.descriptionText || fullDesc.descriptionHtml)) {
                 return {
                     ...job,
+                    title: fullDesc.title || job.title,
+                    company: fullDesc.company || job.company,
+                    location: fullDesc.location || job.location,
+                    postedDate: fullDesc.postedDate || job.postedDate,
                     descriptionHtml: fullDesc.descriptionHtml || job.descriptionHtml,
                     descriptionText: fullDesc.descriptionText || job.descriptionText,
                     experience: fullDesc.experience || job.experience,
                     salary: fullDesc.salary || job.salary,
                     jobType: fullDesc.jobType || job.jobType,
+                    tags: fullDesc.tags || job.tags,
+                    jobId: fullDesc.jobId || job.jobId,
                 };
             }
 
@@ -1191,7 +1306,7 @@ try {
                     // Always enrich from detail pages to get full descriptions
                     if (jobsToSave.length > 0) {
                         log.info('Enriching jobs with full descriptions from detail pages...');
-                        jobsToSave = await enrichJobsWithFullDescriptions(jobsToSave, page);
+                        jobsToSave = await enrichJobsWithFullDescriptions(jobsToSave, page, proxyUrl);
                     }
 
                     // Save jobs to dataset
