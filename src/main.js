@@ -348,6 +348,27 @@ async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 10) {
 }
 
 /**
+ * Navigate with a retry to avoid transient aborts (NS_ERROR_ABORT, etc.)
+ */
+async function navigateWithRetry(page, url) {
+    const attempts = [
+        { waitUntil: 'domcontentloaded', timeout: 30000 },
+        { waitUntil: 'load', timeout: 45000 }
+    ];
+
+    for (let i = 0; i < attempts.length; i++) {
+        try {
+            await page.goto(url, attempts[i]);
+            return;
+        } catch (err) {
+            log.warning(`Navigation attempt ${i + 1} failed (${err.message})`);
+            if (i === attempts.length - 1) throw err;
+            await page.waitForTimeout(2000);
+        }
+    }
+}
+
+/**
  * Extract required headers from Naukri.com page by intercepting actual API requests
  */
 async function extractNaukriHeaders(page) {
@@ -958,11 +979,8 @@ try {
                     'Upgrade-Insecure-Requests': '1',
                 });
 
-                // Navigate to page - faster loading
-                await page.goto(request.url, {
-                    waitUntil: 'domcontentloaded',
-                    timeout: 30000
-                });
+                // Navigate to page with retry to handle aborts
+                await navigateWithRetry(page, request.url);
 
                 // Wait for initial load - reduced timeout for speed
                 await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => { });
