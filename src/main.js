@@ -224,7 +224,7 @@ function htmlToReadableText(html) {
         .trim();
 }
 
-function extractCleanSectionFromCheerio($, selectors, minTextLength = 30) {
+function extractCleanSectionFromCheerio($, selectors, minTextLength = 10) {
     for (const selector of selectors) {
         const el = $(selector).first();
         if (!el.length) continue;
@@ -307,6 +307,63 @@ function normalizeExperienceFromJsonLd(experienceRequirements) {
     if (!Number.isFinite(m) || m <= 0) return '';
     const years = Math.max(0, Math.round((m / 12) * 10) / 10);
     return `${years} years`;
+}
+
+async function fetchDescriptionViaPage(jobUrl, page) {
+    const context = page.context();
+    const primarySelectors = [
+        'div.styles_JDC__dang-inner-html__h0K4t',
+    ];
+    const descriptionSelectors = [
+        'div.styles_JDC__dang-inner-html__h0K4t',
+        'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
+        '.styles_JDC__dang-inner-html__h0K4t',
+        '.styles_dang-inner-html___BCwh',
+        'div[class*="JDC__dang-inner-html"]',
+        'div[class*="dang-inner-html"]',
+        '.jd-desc',
+        '.job-description',
+        '.job-desc',
+        '.job-details',
+        '.jd-cont',
+        '.jd-text',
+        '.description',
+        '.desc',
+        '.detail-contents',
+        '.dang-inner-html',
+        '.text-container',
+        '#job_description',
+        '#jobDescription',
+        '#jobDescriptionText',
+        '[class*="job-description"]',
+        '[class*="jd"]',
+        '[itemprop="description"]',
+        'section[class*="jd"]',
+        'div[class*="job-description"]',
+        'article.jd-info',
+        'section.content',
+        '.job_description',
+        'article .desc',
+    ];
+
+    const pageDetail = await context.newPage();
+    try {
+        await pageDetail.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await pageDetail.waitForSelector(primarySelectors[0], { timeout: 8000 }).catch(() => {});
+        await pageDetail.waitForTimeout(1200);
+        const html = await pageDetail.content();
+        const $ = cheerio.load(html);
+        $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
+
+        let description = extractCleanSectionFromCheerio($, primarySelectors);
+        if (!description) description = extractCleanSectionFromCheerio($, descriptionSelectors);
+        return description;
+    } catch (err) {
+        log.debug(`Detail page fallback fetch failed: ${err.message}`);
+        return null;
+    } finally {
+        await pageDetail.close().catch(() => {});
+    }
 }
 
 function parseJobPostingJsonLdCandidate(candidate) {
@@ -508,6 +565,11 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         if (!description) {
             description = extractCleanSectionFromCheerio($, descriptionSelectors);
         }
+        if (!description) {
+            // Fallback: load detail with Playwright page (handles client-side rendered JD)
+            description = await fetchDescriptionViaPage(jobUrl, page);
+        }
+
         if (!description) return null;
 
         // Also try to extract additional job details from detail page - Naukri-specific
