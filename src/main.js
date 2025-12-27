@@ -376,6 +376,12 @@ async function extractNaukriHeaders(page) {
                 headers['sec-ch-ua-platform'] = requestHeaders['sec-ch-ua-platform'];
                 headers.referer = requestHeaders.referer || 'https://www.naukri.com/';
                 headers.origin = requestHeaders.origin || 'https://www.naukri.com';
+
+                // Fallback: pull nkparam from cookies if missing
+                if (!headers.nkparam && headers.cookie) {
+                    const nk = headers.cookie.split(';').map(c => c.trim()).find(c => c.toLowerCase().startsWith('nkparam='));
+                    if (nk) headers.nkparam = nk.split('=')[1];
+                }
                 
                 log.info('Captured Naukri API headers successfully');
                 resolve(headers);
@@ -410,13 +416,16 @@ async function extractJobsViaAPI(page, searchParams, naukriHeaders) {
 
     try {
         // Build API URL with parameters
+        const keyword = (searchParams.query || '').trim() || 'sales';
+        const location = (searchParams.location || '').trim();
+
         const apiUrl = new URL('https://www.naukri.com/jobapi/v3/search');
         apiUrl.searchParams.set('noOfResults', '20');
         apiUrl.searchParams.set('urlType', 'search_by_keyword');
         apiUrl.searchParams.set('searchType', 'adv');
-        apiUrl.searchParams.set('keyword', searchParams.query);
+        apiUrl.searchParams.set('keyword', keyword);
         apiUrl.searchParams.set('pageNo', searchParams.page || '1');
-        apiUrl.searchParams.set('seoKey', `${searchParams.query.toLowerCase().replace(/\s+/g, '-')}-jobs`);
+        apiUrl.searchParams.set('seoKey', `${keyword.toLowerCase().replace(/\s+/g, '-')}-jobs`);
         apiUrl.searchParams.set('src', 'directSearch');
         apiUrl.searchParams.set('latLong', '');
 
@@ -426,16 +435,23 @@ async function extractJobsViaAPI(page, searchParams, naukriHeaders) {
         }
 
         // Add location if specified
-        if (searchParams.location) {
-            apiUrl.searchParams.set('location', searchParams.location);
+        if (location) {
+            apiUrl.searchParams.set('location', location);
         }
 
         log.info(`API URL: ${apiUrl.toString()}`);
 
         // Get cookies and UA from current page (Camoufox session)
-        const cookies = await page.context().cookies();
-        const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
         const userAgent = await page.evaluate(() => navigator.userAgent);
+
+        // Ensure nkparam is present (fallback from cookies if interceptor missed it)
+        let nkparamHeader = naukriHeaders.nkparam || '';
+        if (!nkparamHeader) {
+            nkparamHeader = await page.evaluate(() => {
+                const nk = document.cookie.split(';').map(c => c.trim()).find(c => c.toLowerCase().startsWith('nkparam='));
+                return nk ? nk.split('=')[1] : '';
+            });
+        }
 
         const requestHeaders = {
             'Accept': 'application/json',
@@ -444,12 +460,14 @@ async function extractJobsViaAPI(page, searchParams, naukriHeaders) {
             'systemid': naukriHeaders.systemid || 'Naukri',
             'clientid': naukriHeaders.clientid || 'd3skt0p',
             'gid': naukriHeaders.gid || 'LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE',
-            'nkparam': naukriHeaders.nkparam || '',
+            'nkparam': nkparamHeader,
             'Accept-Language': naukriHeaders['accept-language'] || 'en-IN,en-US;q=0.9,en;q=0.8',
             'User-Agent': naukriHeaders['user-agent'] || userAgent,
-            'Cookie': naukriHeaders.cookie || cookieString,
             'Referer': naukriHeaders.referer || 'https://www.naukri.com/',
             'Origin': naukriHeaders.origin || 'https://www.naukri.com',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
         };
 
         // Preserve client hints if captured
@@ -457,12 +475,38 @@ async function extractJobsViaAPI(page, searchParams, naukriHeaders) {
         if (naukriHeaders['sec-ch-ua-mobile']) requestHeaders['Sec-CH-UA-Mobile'] = naukriHeaders['sec-ch-ua-mobile'];
         if (naukriHeaders['sec-ch-ua-platform']) requestHeaders['Sec-CH-UA-Platform'] = naukriHeaders['sec-ch-ua-platform'];
 
-        const response = await page.context().request.get(apiUrl.toString(), {
-            headers: requestHeaders,
-            timeout: 15000,
-        });
+        // Let browser fetch to keep Akamai/anti-bot context, with retry
+        const result = await page.evaluate(async ({ url, headers }) => {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort('timeout'), 20000);
+            const doFetch = async () => {
+                const res = await fetch(url, {
+                    method: 'GET',
+                    headers,
+                    credentials: 'include',
+                    cache: 'no-cache',
+                    signal: controller.signal,
+                });
+                const json = await res.json().catch(() => null);
+                return { status: res.status, json };
+            };
+            try {
+                return await doFetch();
+            } catch (err) {
+                return { error: err.message, status: null, json: null };
+            } finally {
+                clearTimeout(timeout);
+            }
+        }, { url: apiUrl.toString(), headers: requestHeaders });
 
-        const status = response.status();
+        if (result.error) {
+            log.warning(`API fetch failed in page context: ${result.error}`);
+            return [];
+        }
+
+        const status = result.status;
+        const json = result.json || {};
+
         if (status === 403 || status === 503 || status === 429) {
             log.warning(`API blocked or throttled with status ${status}`);
             return [];
@@ -472,8 +516,6 @@ async function extractJobsViaAPI(page, searchParams, naukriHeaders) {
             log.warning(`API returned unexpected status ${status}`);
             return [];
         }
-
-        const json = await response.json();
 
         // Parse jobDetails array from response
         const jobDetails = json.jobDetails || [];
@@ -993,16 +1035,21 @@ try {
                 let searchQuery = '';
                 let searchLocation = '';
 
-                // Parse URL pattern: /keyword-jobs-in-location or extract pageNo from query params
-                const pathMatch = currentUrl.match(/\/([^-]+(?:-[^-]+)*)-jobs(?:-in-([^?]+))?/);
-                if (pathMatch) {
-                    searchQuery = pathMatch[1].replace(/-/g, ' ');
-                    searchLocation = pathMatch[2] ? pathMatch[2].replace(/-/g, ' ') : '';
-                }
-
                 // Extract page number from URL query params
                 const urlParams = new URL(currentUrl).searchParams;
                 const currentPageNo = parseInt(urlParams.get('pageNo') || '1', 10);
+
+                // Prefer explicit input values when present
+                const parsedUrl = new URL(currentUrl);
+                const pathMatch = parsedUrl.pathname.match(/\/([^/]+?)-jobs(?:-in-([^/?]+))?/i);
+                if (pathMatch) {
+                    searchQuery = pathMatch[1]?.replace(/-/g, ' ') || searchQuery;
+                    searchLocation = pathMatch[2]?.replace(/-/g, ' ') || searchLocation;
+                }
+
+                // Normalize inputs for API
+                searchQuery = (searchQuery || input.searchQuery || '').trim();
+                searchLocation = (searchLocation || input.location || '').trim();
 
                 log.info(`Search query: "${searchQuery}", Location: "${searchLocation}", Page: ${currentPageNo}`);
 
@@ -1017,8 +1064,8 @@ try {
                     naukriHeaders = await extractNaukriHeaders(page);
                     
                     searchParams = {
-                        query: searchQuery || input.searchQuery,
-                        location: searchLocation || input.location,
+                        query: (searchQuery || input.searchQuery || '').trim(),
+                        location: (searchLocation || input.location || '').trim(),
                         page: currentPageNo,
                         experience: input.experience
                     };
@@ -1081,8 +1128,9 @@ try {
 
                     jobsToSave = uniqueJobs;
 
-                    // Enrich jobs with full descriptions from detail pages
-                    if (jobsToSave.length > 0) {
+                    // Enrich jobs with full descriptions only when needed to save time
+                    const needsEnrichment = jobsToSave.some(job => !job.descriptionText || job.descriptionText.length < 50);
+                    if (jobsToSave.length > 0 && needsEnrichment) {
                         log.info('Enriching jobs with full descriptions from detail pages...');
                         jobsToSave = await enrichJobsWithFullDescriptions(jobsToSave, page);
                     }
