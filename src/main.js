@@ -521,6 +521,45 @@ async function navigateWithRetry(page, url) {
     }
 }
 
+async function waitForSearchResultsToRender(page) {
+    // On some Naukri listing pages (especially keyword-only), SSR contains skeletons.
+    // Wait for client-side rendered links/text to appear before parsing HTML.
+    try {
+        await page.waitForFunction(() => document.title && document.title.trim().length > 0, { timeout: 8000 });
+    } catch {
+        // ignore
+    }
+
+    const selectors = [
+        'a[href*="job-listings"]',
+        'a[href^="/job-listings"]',
+        'div[class*="tuple"] a[href]',
+        'article[class*="tuple"] a[href]',
+    ];
+
+    for (const selector of selectors) {
+        try {
+            await page.waitForSelector(selector, { timeout: 8000 });
+            return;
+        } catch {
+            // try next
+        }
+    }
+
+    try {
+        await page.waitForFunction(() => {
+            const nodes = document.querySelectorAll('div[class*="tuple"], article[class*="tuple"]');
+            for (const node of nodes) {
+                const text = node.innerText || '';
+                if (text.trim().length > 40) return true;
+            }
+            return false;
+        }, { timeout: 8000 });
+    } catch {
+        // ignore
+    }
+}
+
 /**
  * Build Naukri search URL from input parameters
  */
@@ -716,6 +755,26 @@ function extractJobFromElement($, $el, fallback = {}) {
             }
         }
 
+        // More resilient URL extraction: find job listing link within the tuple
+        if (!url) {
+            const anchors = $el.find('a[href]').toArray();
+            for (const a of anchors) {
+                const href = ($(a).attr('href') || '').trim();
+                if (!href) continue;
+                if (!href.includes('job-listings') && !href.startsWith('/job-listings')) continue;
+                url = href.startsWith('http') ? href : `https://www.naukri.com${href}`;
+                if (!title) {
+                    title = ($(a).text() || $(a).attr('title') || '').trim();
+                }
+                break;
+            }
+        }
+
+        if (!url) {
+            const dataHref = ($el.attr('data-href') || $el.attr('data-url') || $el.attr('data-jdurl') || '').trim();
+            if (dataHref) url = dataHref.startsWith('http') ? dataHref : `https://www.naukri.com${dataHref}`;
+        }
+
         // Fallback to link-provided title/url when selectors fail
         if (!title && fallback.title) title = fallback.title;
         if (!url && fallback.url) url = fallback.url;
@@ -727,7 +786,9 @@ function extractJobFromElement($, $el, fallback = {}) {
             'a.comp-name',
             '.company-name',
             'a[class*="company"]',
-            '.row2 a'
+            '.row2 a',
+            'span[class*="comp"]',
+            'a[href*="company"]',
         ];
         
         for (const sel of companySelectors) {
@@ -744,7 +805,8 @@ function extractJobFromElement($, $el, fallback = {}) {
             '.loc-wrap .location, .location',
             '.locWdth',
             'span[class*="location"]',
-            '.row3 .location'
+            '.row3 .location',
+            '[class*="loc"]',
         ];
         
         for (const sel of locationSelectors) {
@@ -1037,7 +1099,7 @@ try {
                 }
 
                 // Add a small delay to ensure dynamic content loads - wait for job listings
-                await page.waitForTimeout(2000);
+                await waitForSearchResultsToRender(page);
 
                 let jobs = [];
                 let pageExtractionMethod = '';
