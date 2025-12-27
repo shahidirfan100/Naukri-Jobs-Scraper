@@ -165,6 +165,7 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Cookie': cookies,
                 'User-Agent': ua,
+                'Referer': 'https://www.naukri.com/',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-Site': 'same-origin',
@@ -319,7 +320,7 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         const salary = $('.salary-wrap .salary, .salary span, [class*="salary"]').first().text().trim() || '';
         const jobType = $('.job-type, .employment-type, [class*="job-type"]').first().text().trim() || '';
 
-        if (descriptionText && descriptionText.length > 50) {
+        if (descriptionText && descriptionText.length > 0) {
             return {
                 descriptionHtml,
                 descriptionText,
@@ -441,7 +442,10 @@ async function extractNaukriHeaders(page) {
 
     // Wait for and intercept API requests to capture headers
     const apiHeadersPromise = new Promise((resolve) => {
-        page.on('request', request => {
+        let resolved = false;
+        const timeoutMs = 4000;
+
+        const onRequest = (request) => {
             const url = request.url();
             if (url.includes('/jobapi/v3/search') || url.includes('naukri.com/jobapi')) {
                 const requestHeaders = request.headers();
@@ -467,25 +471,27 @@ async function extractNaukriHeaders(page) {
                     if (nk) headers.nkparam = nk.split('=')[1];
                 }
                 
-                log.info('Captured Naukri API headers successfully');
-                resolve(headers);
+                if (!resolved) {
+                    resolved = true;
+                    page.off('request', onRequest);
+                    clearTimeout(timeout);
+                    log.info('Captured Naukri API headers successfully');
+                    resolve(headers);
+                }
             }
-        });
+        };
 
-        // Timeout after 10 seconds
-        setTimeout(() => {
-            if (!headers.appid) {
-                log.warning('Timeout waiting for API headers, using fallback values');
-                resolve({
-                    appid: '109',
-                    systemid: 'Naukri',
-                    accept: 'application/json',
-                    'accept-language': 'en-IN,en-US;q=0.9,en;q=0.8',
-                    referer: 'https://www.naukri.com/',
-                    origin: 'https://www.naukri.com'
-                });
+        page.on('request', onRequest);
+
+        // Timeout after a short wait; without session headers the API often fails (406)
+        const timeout = setTimeout(() => {
+            if (!resolved) {
+                resolved = true;
+                page.off('request', onRequest);
+                log.warning('Timeout waiting for API headers; skipping API method');
+                resolve(null);
             }
-        }, 10000);
+        }, timeoutMs);
     });
 
     return apiHeadersPromise;
@@ -670,11 +676,16 @@ function buildSearchUrl(input) {
         return input.searchUrl.trim();
     }
 
-    // Naukri URL format: https://www.naukri.com/{query}-jobs-in-{location}
-    const query = (input.searchQuery || 'sales').toLowerCase().replace(/\s+/g, '-');
-    const location = (input.location || 'mumbai').toLowerCase().replace(/\s+/g, '-');
+    // Naukri URL formats:
+    // - Keyword only: https://www.naukri.com/{query}-jobs
+    // - Keyword + location: https://www.naukri.com/{query}-jobs-in-{location}
+    const query = (input.searchQuery || 'sales').toLowerCase().trim().replace(/\s+/g, '-');
+    const locationRaw = (input.location || '').toLowerCase().trim();
+    const location = locationRaw ? locationRaw.replace(/\s+/g, '-') : '';
     
-    let baseUrl = `https://www.naukri.com/${query}-jobs-in-${location}`;
+    let baseUrl = location
+        ? `https://www.naukri.com/${query}-jobs-in-${location}`
+        : `https://www.naukri.com/${query}-jobs`;
     const params = new URLSearchParams();
 
     // Add experience filter
@@ -707,8 +718,15 @@ async function extractJobDataViaHTML(page) {
         const jobs = [];
 
         // Naukri-specific selectors for job cards
-        // Primary selector: article with srp-tuple class or job card classes
-        const jobElements = $('article.jobTuple, div.srp-tuple, div.jobCard, article[data-job-id]');
+        // Primary selector: "tuple"/"jobTuple" blocks
+        const jobElements = $([
+            'article.jobTuple',
+            'div.srp-tuple',
+            'div.jobCard',
+            'article[data-job-id]',
+            'div[class*="tuple"]',
+            'article[class*="tuple"]',
+        ].join(','));
 
         log.info(`Found ${jobElements.length} job cards`);
 
@@ -726,10 +744,20 @@ async function extractJobDataViaHTML(page) {
                 if (elements.length > 0) {
                     log.info(`Fallback: Found ${elements.length} elements with selector: ${selector}`);
                     elements.each((_, element) => {
-                        const job = extractJobFromElement($, $(element));
-                        if (job) jobs.push(job);
+                        // If this is a container, try extracting tuples within it first
+                        const container = $(element);
+                        const tuples = container.find('article.jobTuple, div.srp-tuple, div.jobCard, article[data-job-id], div[class*="tuple"], article[class*="tuple"]');
+                        if (tuples.length) {
+                            tuples.each((_, tupleEl) => {
+                                const job = extractJobFromElement($, $(tupleEl));
+                                if (job) jobs.push(job);
+                            });
+                        } else {
+                            const job = extractJobFromElement($, container);
+                            if (job) jobs.push(job);
+                        }
                     });
-                    break;
+                    if (jobs.length > 0) break;
                 }
             }
         } else {
@@ -952,11 +980,10 @@ try {
         maxJobs: input.maxJobs
     });
 
-    // Validate input - either searchUrl OR (searchQuery AND location) must be provided
+    // Validate input - either searchUrl OR searchQuery must be provided
     if (!input.searchUrl?.trim()) {
-        // If no searchUrl, both searchQuery and location are required
-        if (!input.searchQuery?.trim() || !input.location?.trim()) {
-            throw new Error('Invalid input: Either provide a "searchUrl" OR both "searchQuery" and "location" are required');
+        if (!input.searchQuery?.trim()) {
+            throw new Error('Invalid input: Either provide a "searchUrl" OR provide a "searchQuery"');
         }
     }
 
@@ -989,9 +1016,14 @@ try {
     const proxyUrl = await proxyConfiguration.newUrl();
 
     // Create Playwright crawler with Camoufox for anti-bot bypass
+    const maxRequestsPerCrawl = Math.min(
+        200,
+        maxJobs === 0 ? 200 : Math.ceil(maxJobs / 20) + 5
+    );
+
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
-        maxRequestsPerCrawl: 20, // Reduced for QA compliance - prevents runaway pagination
+        maxRequestsPerCrawl,
         maxConcurrency: 3, // Increased for faster scraping
         navigationTimeoutSecs: 30, // Reduced for speed
         requestHandlerTimeoutSecs: 120, // Reduced but enough for enrichment
@@ -1108,7 +1140,7 @@ try {
                 await page.waitForTimeout(2000);
 
                 let jobs = [];
-                let extractionMethod = '';
+                let pageExtractionMethod = '';
                 let searchParams = {}; // Declare outside try block for pagination access
 
                 // Extract search parameters from current URL
@@ -1116,16 +1148,27 @@ try {
                 let searchQuery = '';
                 let searchLocation = '';
 
-                // Extract page number from URL query params
-                const urlParams = new URL(currentUrl).searchParams;
-                const currentPageNo = parseInt(urlParams.get('pageNo') || '1', 10);
-
                 // Prefer explicit input values when present
                 const parsedUrl = new URL(currentUrl);
+
+                // Extract page number from URL (supports both `?pageNo=` and `-2` style)
+                const urlParams = parsedUrl.searchParams;
+                let currentPageNo = parseInt(urlParams.get('pageNo') || '1', 10);
+                if (!Number.isFinite(currentPageNo) || currentPageNo < 1) currentPageNo = 1;
+                if (!urlParams.get('pageNo')) {
+                    const pathPageMatch = parsedUrl.pathname.replace(/\/$/, '').match(/-(\d+)$/);
+                    if (pathPageMatch) {
+                        const n = parseInt(pathPageMatch[1], 10);
+                        if (Number.isFinite(n) && n >= 1) currentPageNo = n;
+                    }
+                }
+
                 const pathMatch = parsedUrl.pathname.match(/\/([^/]+?)-jobs(?:-in-([^/?]+))?/i);
                 if (pathMatch) {
                     searchQuery = pathMatch[1]?.replace(/-/g, ' ') || searchQuery;
-                    searchLocation = pathMatch[2]?.replace(/-/g, ' ') || searchLocation;
+                    // Remove pagination suffix from location, e.g. "mumbai-2"
+                    const locSlug = pathMatch[2]?.replace(/-(\d+)$/, '') || '';
+                    searchLocation = locSlug ? locSlug.replace(/-/g, ' ') : searchLocation;
                 }
 
                 // Normalize inputs for API
@@ -1136,13 +1179,17 @@ try {
 
                 // Strategy 1: DIRECT API CALL (PRIMARY - Fastest and most reliable)
                 // First, extract required headers by letting page load and intercepting API calls
-                let naukriHeaders = {};
+                let naukriHeaders = null;
                 try {
                     // Trigger API calls by scrolling/interacting
                     await page.evaluate(() => window.scrollTo(0, 500));
-                    await page.waitForTimeout(2000); // Wait for API calls
+                    await page.waitForTimeout(750); // Wait for API calls
                     
                     naukriHeaders = await extractNaukriHeaders(page);
+
+                    if (!naukriHeaders) {
+                        throw new Error('Naukri API headers not captured');
+                    }
                     
                     searchParams = {
                         query: (searchQuery || input.searchQuery || '').trim(),
@@ -1153,7 +1200,8 @@ try {
 
                     jobs = await extractJobsViaAPI(page, searchParams, naukriHeaders);
                     if (jobs.length > 0) {
-                        extractionMethod = 'Direct API';
+                        pageExtractionMethod = 'Direct API';
+                        extractionMethod = pageExtractionMethod;
                         log.info(`✓ Direct API extraction successful: ${jobs.length} jobs`);
                     }
                 } catch (apiError) {
@@ -1164,7 +1212,8 @@ try {
                 if (jobs.length === 0) {
                     jobs = await extractJobsViaJsonLD(page);
                     if (jobs.length > 0) {
-                        extractionMethod = 'JSON-LD';
+                        pageExtractionMethod = 'JSON-LD';
+                        extractionMethod = pageExtractionMethod;
                         log.info(`✓ JSON-LD extraction successful: ${jobs.length} jobs`);
                     }
                 }
@@ -1173,7 +1222,8 @@ try {
                 if (jobs.length === 0) {
                     jobs = await extractJobDataViaHTML(page);
                     if (jobs.length > 0) {
-                        extractionMethod = 'HTML Parsing (Cheerio)';
+                        pageExtractionMethod = 'HTML Parsing (Cheerio)';
+                        extractionMethod = pageExtractionMethod;
                         log.info(`✓ HTML parsing successful: ${jobs.length} jobs`);
                     }
                 }
@@ -1210,7 +1260,7 @@ try {
                     jobsToSave = uniqueJobs;
 
                     // Always enrich when HTML parsing was used or descriptions are short
-                    const needsEnrichment = extractionMethod !== 'Direct API' ||
+                    const needsEnrichment = pageExtractionMethod !== 'Direct API' ||
                         jobsToSave.some(job => !job.descriptionText || job.descriptionText.length < 50);
                     if (jobsToSave.length > 0 && needsEnrichment) {
                         log.info('Enriching jobs with full descriptions from detail pages...');
@@ -1230,52 +1280,51 @@ try {
                         return;
                     }
 
-                    // Pagination logic - depends on extraction method
-                    if (extractionMethod === 'Direct API') {
-                        // For API extraction, we can directly request next page via API
-                        if (totalJobsScraped < maxJobs) {
-                            const currentPage = searchParams?.page || 1;
-                            const nextPage = currentPage + 1;
-                            
-                            log.info(`API pagination: Requesting page ${nextPage}`);
-                            
-                            // Build next page URL (for crawler continuity)
-                            const currentUrl = page.url();
-                            const nextPageUrl = currentUrl.includes('?') 
-                                ? `${currentUrl}&pageNo=${nextPage}`
-                                : `${currentUrl}?pageNo=${nextPage}`;
-                            
-                            await crawler.addRequests([{
-                                url: nextPageUrl,
-                                uniqueKey: `${nextPageUrl}-page-${nextPage}`
-                            }]);
-                        }
-                    } else {
-                        // For HTML/JSON-LD extraction, look for next page button
-                        const hasNextPage = await page.evaluate(() => {
-                            // Check for next page button - Naukri-specific selectors
-                            const nextButton = document.querySelector('a.fright, a.btn-next, a[title*="Next"]');
-                            return nextButton && !nextButton.classList.contains('disabled');
-                        });
+                    // Pagination: deterministic `pageNo` param to avoid fragile DOM selectors.
+                    // Prefer the real "Next" link; fallback to path-based `-2` URLs.
+                    // Stops automatically if no new jobs are saved or if maxJobs is reached.
+                    if (maxJobs === 0 || totalJobsScraped < maxJobs) {
+                        const maxPages = maxJobs === 0 ? 50 : Math.ceil(maxJobs / 20);
+                        const nextPageNo = currentPageNo + 1;
 
-                        if (hasNextPage && totalJobsScraped < maxJobs) {
-                            // Get next page URL
-                            const nextPageUrl = await page.evaluate(() => {
-                                const nextButton = document.querySelector('a.fright, a.btn-next, a[title*="Next"]');
-                                return nextButton ? nextButton.href : null;
+                        if (nextPageNo <= maxPages && jobsToSave.length > 0) {
+                            // 1) Try "Next" button href
+                            const nextHref = await page.evaluate(() => {
+                                const candidates = Array.from(document.querySelectorAll('a.styles_btn-secondary__2AsIP'));
+                                const next = candidates.find(a => (a.textContent || '').trim().toLowerCase() === 'next');
+                                const href = next?.getAttribute('href') || '';
+                                if (!href) return '';
+                                try {
+                                    return href.startsWith('http') ? href : new URL(href, location.origin).toString();
+                                } catch {
+                                    return '';
+                                }
                             });
 
-                            if (nextPageUrl) {
-                                log.info(`Found next page: ${nextPageUrl}`);
-
-                                // Add the new URL to the queue
-                                await crawler.addRequests([{
-                                    url: nextPageUrl,
-                                    uniqueKey: nextPageUrl
-                                }]);
+                            let nextPageUrl = '';
+                            if (nextHref) {
+                                nextPageUrl = nextHref;
                             }
-                        } else if (!hasNextPage) {
-                            log.info('No next page button found - this may be the last page');
+
+                            // 2) Fallback: build `-2` style URL from current path
+                            if (!nextPageUrl) {
+                                const u = new URL(request.url);
+                                u.searchParams.delete('pageNo');
+                                const basePath = u.pathname.replace(/\/$/, '').replace(/-(\d+)$/, '');
+                                u.pathname = `${basePath}-${nextPageNo}`;
+                                nextPageUrl = u.toString();
+                            }
+
+                            await crawler.addRequests([{
+                                url: nextPageUrl,
+                                uniqueKey: `${nextPageUrl}-page-${nextPageNo}`,
+                            }]);
+
+                            log.info(`Queued next page: ${nextPageUrl}`);
+                        } else if (jobsToSave.length === 0) {
+                            log.info('No new jobs saved on this page; stopping pagination');
+                        } else {
+                            log.info('Reached pagination limit for this run');
                         }
                     }
                 } else {

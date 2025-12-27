@@ -21,10 +21,10 @@
         "location": {
             "title": "Location",
             "type": "string",
-            "description": "Location to search for jobs in India (e.g., 'Mumbai', 'Delhi', 'Bangalore', 'Hyderabad', 'Chennai', 'Pune'). Required if searchUrl is not provided.",
+            "description": "Optional location filter (e.g., 'Mumbai', 'Delhi', 'Bangalore'). Leave empty to search without a location.",
             "editor": "textfield",
-            "default": "Mumbai",
-            "prefill": "Mumbai"
+            "default": "",
+            "prefill": ""
         },
         "maxJobs": {
             "title": "Maximum Jobs",
@@ -86,8 +86,5 @@
             }
         }
     },
-    "required": [
-        "searchQuery",
-        "location"
-    ]
+    "required": []
 }
