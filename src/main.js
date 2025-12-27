@@ -3,6 +3,7 @@ import { PlaywrightCrawler } from 'crawlee';
 import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
 import { firefox } from 'playwright';
 import * as cheerio from 'cheerio';
+import { gotScraping } from 'got-scraping';
 
 // Initialize the Apify SDK
 await Actor.init();
@@ -158,33 +159,59 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         const ua = userAgent || await page.evaluate(() => navigator.userAgent);
         const cookies = cookieString || (await context.cookies()).map(c => `${c.name}=${c.value}`).join('; ');
 
-        // Use the Playwright context request (shares Camoufox session, headers, and TLS fingerprint)
-        const response = await context.request.get(jobUrl, {
-            headers: {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cookie': cookies,
-                'User-Agent': ua,
-                'Referer': 'https://www.naukri.com/',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'same-origin',
-            },
-            timeout: 15000,
-        });
+        const requestHeaders = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-IN,en-US;q=0.9,en;q=0.8',
+            'Cookie': cookies,
+            'User-Agent': ua,
+            'Referer': 'https://www.naukri.com/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+        };
 
-        const status = response.status();
-        if (status === 403 || status === 503) {
-            log.debug(`Block detected on detail page (${status}): ${jobUrl}`);
-            return { blocked: true }; // Signal that session needs refresh
+        // Fast path: use got-scraping (HTTP client) for speed; fallback to Playwright session on blocks.
+        let body = '';
+        try {
+            const resp = await gotScraping({
+                url: jobUrl,
+                headers: requestHeaders,
+                http2: true,
+                timeout: { request: 15000 },
+                retry: { limit: 1 },
+            });
+
+            if (resp.statusCode === 403 || resp.statusCode === 503 || resp.statusCode === 429) {
+                throw new Error(`blocked_http_${resp.statusCode}`);
+            }
+
+            if (resp.statusCode !== 200) {
+                log.debug(`Detail page returned status ${resp.statusCode}: ${jobUrl}`);
+                return null;
+            }
+
+            body = resp.body || '';
+        } catch (httpErr) {
+            // Fallback: Use the Playwright context request (shares Camoufox session)
+            const response = await context.request.get(jobUrl, {
+                headers: requestHeaders,
+                timeout: 20000,
+            });
+
+            const status = response.status();
+            if (status === 403 || status === 503 || status === 429) {
+                log.debug(`Block detected on detail page (${status}): ${jobUrl}`);
+                return { blocked: true };
+            }
+
+            if (status !== 200) {
+                log.debug(`Detail page returned status ${status}: ${jobUrl}`);
+                return null;
+            }
+
+            body = await response.text();
         }
 
-        if (status !== 200) {
-            log.debug(`Detail page returned status ${status}: ${jobUrl}`);
-            return null;
-        }
-
-        const body = await response.text();
         const $ = cheerio.load(body);
 
         // Check if we got a challenge page
@@ -197,12 +224,45 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
         // Remove source/apply buttons and unwanted elements
         $('p.source, [data-source], .source, .apply-button, .actions, .notclicky').remove();
 
+        // Prefer JSON-LD JobPosting description if present (usually the most complete)
+        const jsonLdScripts = $('script[type="application/ld+json"]').map((_, el) => $(el).text()).get();
+        for (const script of jsonLdScripts) {
+            try {
+                const data = JSON.parse(script);
+                const candidates = [];
+                if (Array.isArray(data)) candidates.push(...data);
+                else candidates.push(data);
+
+                for (const candidate of candidates) {
+                    if (!candidate) continue;
+                    if (candidate['@type'] === 'JobPosting' && candidate.description) {
+                        const descriptionHtml = String(candidate.description);
+                        const descriptionText = stripHtml(descriptionHtml);
+                        return { descriptionHtml, descriptionText };
+                    }
+                    if (candidate['@graph'] && Array.isArray(candidate['@graph'])) {
+                        for (const g of candidate['@graph']) {
+                            if (g && g['@type'] === 'JobPosting' && g.description) {
+                                const descriptionHtml = String(g.description);
+                                const descriptionText = stripHtml(descriptionHtml);
+                                return { descriptionHtml, descriptionText };
+                            }
+                        }
+                    }
+                }
+            } catch {
+                // ignore parse errors
+            }
+        }
+
         // Try multiple selectors for job description on detail page - Naukri-specific
         const descriptionSelectors = [
             'div.styles_JDC__dang-inner-html__h0K4t',
             'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
             '.styles_JDC__dang-inner-html__h0K4t',
             '.styles_dang-inner-html___BCwh',
+            'div[class*="JDC__dang-inner-html"]',
+            'div[class*="dang-inner-html"]',
             '.jd-desc',
             '.job-description',
             '.job-desc',
@@ -271,6 +331,7 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
                 'div.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
                 '.styles_detail__U2rw4.styles_dang-inner-html___BCwh',
                 '.styles_dang-inner-html___BCwh',
+                'div[class*="styles_detail__"][class*="dang-inner-html"]',
                 '.about-company',
                 '.company-info',
             ];
@@ -284,30 +345,12 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
             }
         }
 
-        // As a last resort, parse JSON-LD on the detail page for description
+        // As a last resort, use the full body text if something went wrong with selectors.
         if (!descriptionText) {
-            const jsonLdScripts = $('script[type="application/ld+json"]').map((_, el) => $(el).text()).get();
-            for (const script of jsonLdScripts) {
-                try {
-                    const data = JSON.parse(script);
-                    if (data.description) {
-                        descriptionHtml = data.description;
-                        descriptionText = stripHtml(data.description);
-                        break;
-                    }
-                    if (Array.isArray(data)) {
-                        for (const item of data) {
-                            if (item.description) {
-                                descriptionHtml = item.description;
-                                descriptionText = stripHtml(item.description);
-                                break;
-                            }
-                        }
-                    }
-                } catch {
-                    // ignore parse errors
-                }
-                if (descriptionText) break;
+            const bodyText = $('body').text().trim();
+            if (bodyText.length > 0) {
+                descriptionText = bodyText;
+                descriptionHtml = $('body').html()?.trim() || '';
             }
         }
 
@@ -346,7 +389,7 @@ async function fetchFullDescription(jobUrl, page, userAgent = '', cookieString =
  * Enrich jobs with full descriptions from detail pages
  * Uses session cookies from Camoufox to maintain Cloudflare bypass
  */
-async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 10) {
+async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 20) {
     if (jobs.length === 0) return jobs;
 
     log.info(`Fetching full descriptions for ${jobs.length} jobs...`);
@@ -379,11 +422,11 @@ async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 10) {
                 return job;
             }
 
-            if (fullDesc && fullDesc.descriptionHtml) {
+            if (fullDesc && (fullDesc.descriptionText || fullDesc.descriptionHtml)) {
                 return {
                     ...job,
-                    descriptionHtml: fullDesc.descriptionHtml,
-                    descriptionText: fullDesc.descriptionText,
+                    descriptionHtml: fullDesc.descriptionHtml || job.descriptionHtml,
+                    descriptionText: fullDesc.descriptionText || job.descriptionText,
                     experience: fullDesc.experience || job.experience,
                     salary: fullDesc.salary || job.salary,
                     jobType: fullDesc.jobType || job.jobType,
@@ -398,9 +441,9 @@ async function enrichJobsWithFullDescriptions(jobs, page, maxConcurrency = 10) {
 
         log.info(`Enriched ${Math.min(i + batchSize, jobs.length)}/${jobs.length} jobs with full descriptions`);
 
-        // Small delay between batches - reduced for speed
+        // Small delay between batches - keep minimal to reduce throttling risk
         if (i + batchSize < jobs.length) {
-            await new Promise(resolve => setTimeout(resolve, 200));
+            await new Promise(resolve => setTimeout(resolve, 50));
         }
     }
 
@@ -429,240 +472,6 @@ async function navigateWithRetry(page, url) {
             if (i === attempts.length - 1) throw err;
             await page.waitForTimeout(2000);
         }
-    }
-}
-
-/**
- * Extract required headers from Naukri.com page by intercepting actual API requests
- */
-async function extractNaukriHeaders(page) {
-    log.info('Extracting Naukri API headers from page...');
-
-    const headers = {};
-
-    // Wait for and intercept API requests to capture headers
-    const apiHeadersPromise = new Promise((resolve) => {
-        let resolved = false;
-        const timeoutMs = 4000;
-
-        const onRequest = (request) => {
-            const url = request.url();
-            if (url.includes('/jobapi/v3/search') || url.includes('naukri.com/jobapi')) {
-                const requestHeaders = request.headers();
-                // Extract critical headers
-                headers.appid = requestHeaders.appid || requestHeaders.Appid;
-                headers.systemid = requestHeaders.systemid || requestHeaders.Systemid || requestHeaders.systemId;
-                headers.clientid = requestHeaders.clientid || requestHeaders.clientId;
-                headers.gid = requestHeaders.gid;
-                headers.nkparam = requestHeaders.nkparam;
-                headers.cookie = requestHeaders.cookie;
-                headers['user-agent'] = requestHeaders['user-agent'];
-                headers.accept = 'application/json';
-                headers['accept-language'] = requestHeaders['accept-language'] || 'en-IN,en-US;q=0.9,en;q=0.8';
-                headers['sec-ch-ua'] = requestHeaders['sec-ch-ua'];
-                headers['sec-ch-ua-mobile'] = requestHeaders['sec-ch-ua-mobile'];
-                headers['sec-ch-ua-platform'] = requestHeaders['sec-ch-ua-platform'];
-                headers.referer = requestHeaders.referer || 'https://www.naukri.com/';
-                headers.origin = requestHeaders.origin || 'https://www.naukri.com';
-
-                // Fallback: pull nkparam from cookies if missing
-                if (!headers.nkparam && headers.cookie) {
-                    const nk = headers.cookie.split(';').map(c => c.trim()).find(c => c.toLowerCase().startsWith('nkparam='));
-                    if (nk) headers.nkparam = nk.split('=')[1];
-                }
-                
-                if (!resolved) {
-                    resolved = true;
-                    page.off('request', onRequest);
-                    clearTimeout(timeout);
-                    log.info('Captured Naukri API headers successfully');
-                    resolve(headers);
-                }
-            }
-        };
-
-        page.on('request', onRequest);
-
-        // Timeout after a short wait; without session headers the API often fails (406)
-        const timeout = setTimeout(() => {
-            if (!resolved) {
-                resolved = true;
-                page.off('request', onRequest);
-                log.warning('Timeout waiting for API headers; skipping API method');
-                resolve(null);
-            }
-        }, timeoutMs);
-    });
-
-    return apiHeadersPromise;
-}
-
-/**
- * Call Naukri API directly using /jobapi/v3/search endpoint
- * This is the PRIMARY and FASTEST method
- */
-async function extractJobsViaAPI(page, searchParams, naukriHeaders) {
-    log.info('Attempting direct Naukri API extraction via Playwright session');
-
-    try {
-        // Build API URL with parameters
-        const keyword = (searchParams.query || '').trim() || 'sales';
-        const location = (searchParams.location || '').trim();
-
-        const apiUrl = new URL('https://www.naukri.com/jobapi/v3/search');
-        apiUrl.searchParams.set('noOfResults', '20');
-        apiUrl.searchParams.set('urlType', 'search_by_keyword');
-        apiUrl.searchParams.set('searchType', 'adv');
-        apiUrl.searchParams.set('keyword', keyword);
-        apiUrl.searchParams.set('pageNo', searchParams.page || '1');
-        apiUrl.searchParams.set('seoKey', `${keyword.toLowerCase().replace(/\s+/g, '-')}-jobs`);
-        apiUrl.searchParams.set('src', 'directSearch');
-        apiUrl.searchParams.set('latLong', '');
-
-        // Add experience filter if specified
-        if (searchParams.experience && searchParams.experience !== 'all') {
-            apiUrl.searchParams.set('experience', searchParams.experience);
-        }
-
-        // Add location if specified
-        if (location) {
-            apiUrl.searchParams.set('location', location);
-        }
-
-        log.info(`API URL: ${apiUrl.toString()}`);
-
-        // Get cookies and UA from current page (Camoufox session)
-        const userAgent = await page.evaluate(() => navigator.userAgent);
-
-        // Ensure nkparam is present (fallback from cookies if interceptor missed it)
-        let nkparamHeader = naukriHeaders.nkparam || '';
-        if (!nkparamHeader) {
-            nkparamHeader = await page.evaluate(() => {
-                const nk = document.cookie.split(';').map(c => c.trim()).find(c => c.toLowerCase().startsWith('nkparam='));
-                return nk ? nk.split('=')[1] : '';
-            });
-        }
-
-        const requestHeaders = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'appid': naukriHeaders.appid || '109',
-            'systemid': naukriHeaders.systemid || 'Naukri',
-            'clientid': naukriHeaders.clientid || 'd3skt0p',
-            'gid': naukriHeaders.gid || 'LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE',
-            'nkparam': nkparamHeader,
-            'Accept-Language': naukriHeaders['accept-language'] || 'en-IN,en-US;q=0.9,en;q=0.8',
-            'User-Agent': naukriHeaders['user-agent'] || userAgent,
-            'Referer': naukriHeaders.referer || 'https://www.naukri.com/',
-            'Origin': naukriHeaders.origin || 'https://www.naukri.com',
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Dest': 'empty',
-        };
-
-        // Preserve client hints if captured
-        if (naukriHeaders['sec-ch-ua']) requestHeaders['Sec-CH-UA'] = naukriHeaders['sec-ch-ua'];
-        if (naukriHeaders['sec-ch-ua-mobile']) requestHeaders['Sec-CH-UA-Mobile'] = naukriHeaders['sec-ch-ua-mobile'];
-        if (naukriHeaders['sec-ch-ua-platform']) requestHeaders['Sec-CH-UA-Platform'] = naukriHeaders['sec-ch-ua-platform'];
-
-        // Let browser fetch to keep Akamai/anti-bot context, with retry
-        const result = await page.evaluate(async ({ url, headers }) => {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort('timeout'), 20000);
-            const doFetch = async () => {
-                const res = await fetch(url, {
-                    method: 'GET',
-                    headers,
-                    credentials: 'include',
-                    cache: 'no-cache',
-                    signal: controller.signal,
-                });
-                const json = await res.json().catch(() => null);
-                return { status: res.status, json };
-            };
-            try {
-                return await doFetch();
-            } catch (err) {
-                return { error: err.message, status: null, json: null };
-            } finally {
-                clearTimeout(timeout);
-            }
-        }, { url: apiUrl.toString(), headers: requestHeaders });
-
-        if (result.error) {
-            log.warning(`API fetch failed in page context: ${result.error}`);
-            return [];
-        }
-
-        const status = result.status;
-        const json = result.json || {};
-
-        if (status === 403 || status === 503 || status === 429) {
-            log.warning(`API blocked or throttled with status ${status}`);
-            return [];
-        }
-
-        if (status !== 200) {
-            log.warning(`API returned unexpected status ${status}`);
-            return [];
-        }
-
-        // Parse jobDetails array from response
-        const jobDetails = json.jobDetails || [];
-
-        if (!Array.isArray(jobDetails) || jobDetails.length === 0) {
-            log.warning('API response does not contain jobDetails array');
-            return [];
-        }
-
-        log.info(`API returned ${jobDetails.length} jobs`);
-
-        // Transform API response to our format
-        const jobs = jobDetails.map(job => {
-            // Extract experience from placeholders
-            const expPlaceholder = job.placeholders?.find(p => p.type === 'experience');
-            const salaryPlaceholder = job.placeholders?.find(p => p.type === 'salary');
-            const locationPlaceholder = job.placeholders?.find(p => p.type === 'location');
-
-            // Build full URL from jdURL
-            const jobUrl = job.jdURL ? `https://www.naukri.com${job.jdURL}` : '';
-
-            // Format salary
-            let salary = salaryPlaceholder?.label || 'Not disclosed';
-            if (job.salaryDetail && !job.salaryDetail.hideSalary) {
-                const min = job.salaryDetail.minimumSalary;
-                const max = job.salaryDetail.maximumSalary;
-                const currency = job.salaryDetail.currency || 'INR';
-                if (min > 0 || max > 0) {
-                    salary = `${min}-${max} ${currency}`;
-                }
-            }
-
-            return {
-                title: job.title || '',
-                company: job.companyName || '',
-                location: locationPlaceholder?.label || '',
-                salary: salary,
-                experience: expPlaceholder?.label || job.experienceText || 'Not specified',
-                jobType: job.mode === 'jp' ? 'Full Time' : 'Not specified',
-                postedDate: job.footerPlaceholderLabel || '',
-                descriptionHtml: job.jobDescription || '',
-                descriptionText: stripHtml(job.jobDescription || ''),
-                url: jobUrl,
-                jobId: job.jobId || '',
-                companyId: job.companyId || '',
-                tags: job.tagsAndSkills || '',
-                scrapedAt: new Date().toISOString()
-            };
-        });
-
-        log.info(`Successfully parsed ${jobs.length} jobs from API`);
-        return jobs;
-
-    } catch (error) {
-        log.error(`API extraction failed: ${error.message}`);
-        log.debug(error.stack);
-        return [];
     }
 }
 
@@ -1222,54 +1031,21 @@ try {
 
                 log.info(`Search query: "${searchQuery}", Location: "${searchLocation}", Page: ${currentPageNo}`);
 
-                // Strategy 1: DIRECT API CALL (PRIMARY - Fastest and most reliable)
-                // First, extract required headers by letting page load and intercepting API calls
-                let naukriHeaders = null;
-                try {
-                    // Trigger API calls by scrolling/interacting
-                    await page.evaluate(() => window.scrollTo(0, 500));
-                    await page.waitForTimeout(750); // Wait for API calls
-                    
-                    naukriHeaders = await extractNaukriHeaders(page);
-
-                    if (!naukriHeaders) {
-                        throw new Error('Naukri API headers not captured');
-                    }
-                    
-                    searchParams = {
-                        query: (searchQuery || input.searchQuery || '').trim(),
-                        location: (searchLocation || input.location || '').trim(),
-                        page: currentPageNo,
-                        experience: input.experience
-                    };
-
-                    jobs = await extractJobsViaAPI(page, searchParams, naukriHeaders);
-                    if (jobs.length > 0) {
-                        pageExtractionMethod = 'Direct API';
-                        extractionMethod = pageExtractionMethod;
-                        log.info(`✓ Direct API extraction successful: ${jobs.length} jobs`);
-                    }
-                } catch (apiError) {
-                    log.warning(`Direct API extraction failed: ${apiError.message}`);
+                // Strategy 1: HTML parsing (fast and most reliable without IN residential proxy)
+                jobs = await extractJobDataViaHTML(page);
+                if (jobs.length > 0) {
+                    pageExtractionMethod = 'HTML Parsing (Cheerio)';
+                    extractionMethod = pageExtractionMethod;
+                    log.info(`✓ HTML parsing successful: ${jobs.length} jobs`);
                 }
 
-                // Strategy 2: JSON-LD fallback (fast if present)
+                // Strategy 2: JSON-LD fallback (sometimes present)
                 if (jobs.length === 0) {
                     jobs = await extractJobsViaJsonLD(page);
                     if (jobs.length > 0) {
                         pageExtractionMethod = 'JSON-LD';
                         extractionMethod = pageExtractionMethod;
                         log.info(`✓ JSON-LD extraction successful: ${jobs.length} jobs`);
-                    }
-                }
-
-                // Strategy 3: Fall back to HTML parsing with Cheerio
-                if (jobs.length === 0) {
-                    jobs = await extractJobDataViaHTML(page);
-                    if (jobs.length > 0) {
-                        pageExtractionMethod = 'HTML Parsing (Cheerio)';
-                        extractionMethod = pageExtractionMethod;
-                        log.info(`✓ HTML parsing successful: ${jobs.length} jobs`);
                     }
                 }
 
@@ -1304,10 +1080,8 @@ try {
 
                     jobsToSave = uniqueJobs;
 
-                    // Always enrich when HTML parsing was used or descriptions are short
-                    const needsEnrichment = pageExtractionMethod !== 'Direct API' ||
-                        jobsToSave.some(job => !job.descriptionText || job.descriptionText.length < 50);
-                    if (jobsToSave.length > 0 && needsEnrichment) {
+                    // Always enrich from detail pages to get full descriptions
+                    if (jobsToSave.length > 0) {
                         log.info('Enriching jobs with full descriptions from detail pages...');
                         jobsToSave = await enrichJobsWithFullDescriptions(jobsToSave, page);
                     }
