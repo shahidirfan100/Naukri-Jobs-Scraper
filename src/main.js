@@ -1160,7 +1160,16 @@ try {
                     log.warning(`Direct API extraction failed: ${apiError.message}`);
                 }
 
-                // Strategy 2: Fall back to HTML parsing with Cheerio (skip JSON-LD to save time)
+                // Strategy 2: JSON-LD fallback (fast if present)
+                if (jobs.length === 0) {
+                    jobs = await extractJobsViaJsonLD(page);
+                    if (jobs.length > 0) {
+                        extractionMethod = 'JSON-LD';
+                        log.info(`✓ JSON-LD extraction successful: ${jobs.length} jobs`);
+                    }
+                }
+
+                // Strategy 3: Fall back to HTML parsing with Cheerio
                 if (jobs.length === 0) {
                     jobs = await extractJobDataViaHTML(page);
                     if (jobs.length > 0) {
